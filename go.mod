@@ -2,6 +2,8 @@ module github.com/dapr/components-contrib
 
 go 1.20
 
+replace github.com/dapr/kit => ../kit/
+
 require (
 	cloud.google.com/go/datastore v1.10.0
 	cloud.google.com/go/pubsub v1.28.0
@@ -46,7 +48,7 @@ require (
 	github.com/cloudevents/sdk-go/v2 v2.13.0
 	github.com/cyphar/filepath-securejoin v0.2.3
 	github.com/dancannon/gorethink v4.0.0+incompatible
-	github.com/dapr/kit v0.0.4
+	github.com/dapr/kit v0.0.0-00010101000000-000000000000
 	github.com/denisenkom/go-mssqldb v0.12.3
 	github.com/didip/tollbooth/v7 v7.0.1
 	github.com/eclipse/paho.mqtt.golang v1.4.2

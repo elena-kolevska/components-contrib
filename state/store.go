@@ -20,6 +20,11 @@ import (
 	"github.com/dapr/components-contrib/health"
 )
 
+const (
+	ResourceType     = "StateStore"
+	StateStoreReason = "DPR_COMP_STS_1"
+)
+
 // Store is an interface to perform operations on store.
 type Store interface {
 	BulkStore
