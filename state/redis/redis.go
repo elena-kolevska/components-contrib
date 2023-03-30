@@ -21,9 +21,6 @@ import (
 	"strings"
 
 	jsoniter "github.com/json-iterator/go"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/dapr/components-contrib/contenttype"
 	rediscomponent "github.com/dapr/components-contrib/internal/component/redis"
@@ -33,6 +30,7 @@ import (
 	"github.com/dapr/components-contrib/state/utils"
 	"github.com/dapr/kit/logger"
 	"github.com/dapr/kit/ptr"
+	kstatus "github.com/dapr/kit/status"
 )
 
 const (
@@ -242,7 +240,7 @@ func (r *StateStore) getDefault(ctx context.Context, req *state.GetRequest) (*st
 	res, err := r.client.DoRead(ctx, "HGETALL", req.Key) // Prefer values with ETags
 	if err != nil {
 		errDesc := fmt.Sprintf("unable to perform Redis.HGETALL call: %v", err)
-		return nil, r.constructError(err, errDesc, req)
+		return nil, state.ConstructError(kstatus.NO_CONNECTION, err, req.Key, errDesc, r.clientSettings.Username, domain, resourceName, req.Metadata)
 		//return r.directGet(ctx, req) // Falls back to original get for backward compats.
 	}
 	if res == nil {
@@ -271,41 +269,6 @@ func (r *StateStore) getDefault(ctx context.Context, req *state.GetRequest) (*st
 		Data: []byte(data),
 		ETag: version,
 	}, nil
-}
-
-func (r *StateStore) constructError(err error, errDescription string, req *state.GetRequest) error {
-	ei := r.constructErrorInfo(req)
-	ri := r.constructResourceInfo(errDescription)
-	ste, stErr := status.Newf(codes.Unavailable, errDescription).WithDetails(ei, ri)
-	if stErr != nil {
-		r.logger.Errorf("unable to generate Status Code Error: %v\n", stErr)
-		return err
-	}
-	return ste.Err()
-}
-
-func (r *StateStore) constructResourceInfo(description string) *errdetails.ResourceInfo {
-	owner := r.clientSettings.Username
-	return &errdetails.ResourceInfo{
-		ResourceType: state.ResourceType,
-		ResourceName: resourceName,
-		Owner:        owner,
-		Description:  description,
-	}
-}
-
-func (r *StateStore) constructErrorInfo(req *state.GetRequest) *errdetails.ErrorInfo {
-	ei := errdetails.ErrorInfo{
-		Domain: domain,
-		Reason: state.StateStoreReason,
-		Metadata: map[string]string{
-			"key": req.Key,
-		},
-	}
-	for k, v := range req.Metadata {
-		ei.Metadata[k] = v
-	}
-	return &ei
 }
 
 func (r *StateStore) getJSON(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {

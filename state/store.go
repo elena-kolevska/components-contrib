@@ -18,6 +18,8 @@ import (
 	"fmt"
 
 	"github.com/dapr/components-contrib/health"
+	kitstatus "github.com/dapr/kit/status"
+	"google.golang.org/grpc/codes"
 )
 
 const (
@@ -34,6 +36,10 @@ type Store interface {
 	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
 	Set(ctx context.Context, req *SetRequest) error
 	GetComponentMetadata() map[string]string
+}
+
+func ConstructError(code codes.Code, err error, key, errDescription, owner, domain, resourceName string, metadata map[string]string) error {
+	return kitstatus.ConstructError(code, err, key, errDescription, ResourceType, StateStoreReason, owner, domain, resourceName, metadata)
 }
 
 func Ping(ctx context.Context, store Store) error {
