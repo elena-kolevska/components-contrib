@@ -120,6 +120,59 @@ func TestQueuesWithTTL(t *testing.T) {
 	assert.NoError(t, r.Close())
 }
 
+func TestQueuesReconnect(t *testing.T) {
+	rabbitmqHost := getTestRabbitMQHost()
+	assert.NotEmpty(t, rabbitmqHost, fmt.Sprintf("RabbitMQ host configuration must be set in environment variable '%s' (example 'amqp://guest:guest@localhost:5672/')", testRabbitMQHostEnvKey))
+
+	queueName := uuid.New().String()
+	durable := true
+	exclusive := false
+
+	metadata := bindings.Metadata{
+		Base: contribMetadata.Base{
+			Name: "testQueue",
+			Properties: map[string]string{
+				"queueName":        queueName,
+				"host":             rabbitmqHost,
+				"deleteWhenUnused": strconv.FormatBool(exclusive),
+				"durable":          strconv.FormatBool(durable),
+			},
+		},
+	}
+
+	var messageReceivedCount int
+	var handler bindings.Handler = func(ctx context.Context, in *bindings.ReadResponse) ([]byte, error) {
+		messageReceivedCount++
+		return nil, nil
+	}
+
+	logger := logger.NewLogger("test")
+
+	r := NewRabbitMQ(logger).(*RabbitMQ)
+	err := r.Init(context.Background(), metadata)
+	assert.Nil(t, err)
+
+	err = r.Read(context.Background(), handler)
+	assert.Nil(t, err)
+
+	const tooLateMsgContent = "success_msg1"
+	_, err = r.Invoke(context.Background(), &bindings.InvokeRequest{Data: []byte(tooLateMsgContent)})
+	assert.Nil(t, err)
+
+	// perform a close connection with the rabbitmq server
+	r.channel.Close()
+	time.Sleep(3 * defaultReconnectWait)
+
+	const testMsgContent = "reconnect_msg"
+	_, err = r.Invoke(context.Background(), &bindings.InvokeRequest{Data: []byte(testMsgContent)})
+	assert.Nil(t, err)
+
+	time.Sleep(defaultReconnectWait)
+	// sending 2 messages, one before the reconnect and one after
+	assert.Equal(t, 2, messageReceivedCount)
+	assert.NoError(t, r.Close())
+}
+
 func TestPublishingWithTTL(t *testing.T) {
 	rabbitmqHost := getTestRabbitMQHost()
 	assert.NotEmpty(t, rabbitmqHost, fmt.Sprintf("RabbitMQ host configuration must be set in environment variable '%s' (example 'amqp://guest:guest@localhost:5672/')", testRabbitMQHostEnvKey))
@@ -196,7 +249,7 @@ func TestPublishingWithTTL(t *testing.T) {
 	assert.Equal(t, testMsgContent, msgBody)
 
 	assert.NoError(t, rabbitMQBinding1.Close())
-	assert.NoError(t, rabbitMQBinding1.Close())
+	assert.NoError(t, rabbitMQBinding2.Close())
 }
 
 func TestExclusiveQueue(t *testing.T) {
@@ -335,4 +388,61 @@ func TestPublishWithPriority(t *testing.T) {
 	assert.Nil(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, lowPriorityMsgContent, string(msg.Body))
+}
+
+func TestPublishWithHeaders(t *testing.T) {
+	rabbitmqHost := getTestRabbitMQHost()
+	assert.NotEmpty(t, rabbitmqHost, fmt.Sprintf("RabbitMQ host configuration must be set in environment variable '%s' (example 'amqp://guest:guest@localhost:5672/')", testRabbitMQHostEnvKey))
+
+	queueName := uuid.New().String()
+	durable := true
+	exclusive := false
+	const maxPriority = 10
+
+	metadata := bindings.Metadata{
+		Base: contribMetadata.Base{
+			Name: "testQueue",
+			Properties: map[string]string{
+				"queueName":        queueName,
+				"host":             rabbitmqHost,
+				"deleteWhenUnused": strconv.FormatBool(exclusive),
+				"durable":          strconv.FormatBool(durable),
+				"maxPriority":      strconv.FormatInt(maxPriority, 10),
+			},
+		},
+	}
+
+	logger := logger.NewLogger("test")
+
+	r := NewRabbitMQ(logger).(*RabbitMQ)
+	err := r.Init(context.Background(), metadata)
+	assert.NoError(t, err)
+
+	// Assert that if waited too long, we won't see any message
+	conn, err := amqp.Dial(rabbitmqHost)
+	assert.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	assert.NoError(t, err)
+	defer ch.Close()
+
+	const msgContent = "some content"
+	_, err = r.Invoke(context.Background(), &bindings.InvokeRequest{
+		Metadata: map[string]string{
+			"custom_header1": "some value",
+			"custom_header2": "some other value",
+		},
+		Data: []byte(msgContent),
+	})
+	assert.NoError(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+
+	msg, ok, err := getMessageWithRetries(ch, queueName, 1*time.Second)
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, msgContent, string(msg.Body))
+	assert.Contains(t, msg.Header, "custom_header1")
+	assert.Contains(t, msg.Header, "custom_header2")
 }

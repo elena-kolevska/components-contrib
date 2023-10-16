@@ -16,6 +16,7 @@ package servicebus
 import (
 	"testing"
 
+	azservicebus "github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -227,7 +228,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional timeoutInSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyTimeoutInSec] = ""
+		delete(fakeProperties, keyTimeoutInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -286,7 +287,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional handlerTimeoutInSec pubsub", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyHandlerTimeoutInSec] = ""
+		delete(fakeProperties, keyHandlerTimeoutInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -309,7 +310,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional lockRenewalInSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyLockRenewalInSec] = ""
+		delete(fakeProperties, keyLockRenewalInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -332,7 +333,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional maxRetriableErrorsPerSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxRetriableErrorsPerSec] = ""
+		delete(fakeProperties, keyMaxRetriableErrorsPerSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -343,22 +344,12 @@ func TestParseServiceBusMetadata(t *testing.T) {
 	})
 
 	t.Run("invalid optional maxRetriableErrorsPerSec", func(t *testing.T) {
-		// NaN: Not a Number
-		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxRetriableErrorsPerSec] = invalidNumber
-
-		// act.
-		_, err := ParseMetadata(fakeProperties, nil, 0)
-
-		// assert.
-		assert.Error(t, err)
-
 		// Negative number
-		fakeProperties = getFakeProperties()
+		fakeProperties := getFakeProperties()
 		fakeProperties[keyMaxRetriableErrorsPerSec] = "-1"
 
 		// act.
-		_, err = ParseMetadata(fakeProperties, nil, 0)
+		_, err := ParseMetadata(fakeProperties, nil, 0)
 
 		// assert.
 		assert.Error(t, err)
@@ -366,7 +357,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional maxActiveMessages binding", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxActiveMessages] = ""
+		delete(fakeProperties, keyMaxActiveMessages)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, MetadataModeBinding)
@@ -378,7 +369,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional maxActiveMessages pubsub", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxActiveMessages] = ""
+		delete(fakeProperties, keyMaxActiveMessages)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -401,7 +392,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional maxConnectionRecoveryInSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxConnectionRecoveryInSec] = ""
+		delete(fakeProperties, keyMaxConnectionRecoveryInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -424,7 +415,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional minConnectionRecoveryInSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyMinConnectionRecoveryInSec] = ""
+		delete(fakeProperties, keyMinConnectionRecoveryInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -447,7 +438,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing optional maxConcurrentHandlers", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxConcurrentHandlers] = ""
+		delete(fakeProperties, keyMaxConcurrentHandlers)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -470,7 +461,7 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 	t.Run("missing nullable maxDeliveryCount", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxDeliveryCount] = ""
+		delete(fakeProperties, keyMaxDeliveryCount)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -480,20 +471,9 @@ func TestParseServiceBusMetadata(t *testing.T) {
 		assert.Nil(t, err)
 	})
 
-	t.Run("invalid nullable maxDeliveryCount", func(t *testing.T) {
-		fakeProperties := getFakeProperties()
-		fakeProperties[keyMaxDeliveryCount] = invalidNumber
-
-		// act.
-		_, err := ParseMetadata(fakeProperties, nil, 0)
-
-		// assert.
-		assert.Error(t, err)
-	})
-
 	t.Run("missing nullable defaultMessageTimeToLiveInSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyDefaultMessageTimeToLiveInSec] = ""
+		delete(fakeProperties, keyDefaultMessageTimeToLiveInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -503,20 +483,9 @@ func TestParseServiceBusMetadata(t *testing.T) {
 		assert.Nil(t, err)
 	})
 
-	t.Run("invalid nullable defaultMessageTimeToLiveInSec", func(t *testing.T) {
-		fakeProperties := getFakeProperties()
-		fakeProperties[keyDefaultMessageTimeToLiveInSec] = invalidNumber
-
-		// act.
-		_, err := ParseMetadata(fakeProperties, nil, 0)
-
-		// assert.
-		assert.Error(t, err)
-	})
-
 	t.Run("missing nullable autoDeleteOnIdleInSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyAutoDeleteOnIdleInSec] = ""
+		delete(fakeProperties, keyAutoDeleteOnIdleInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -526,20 +495,9 @@ func TestParseServiceBusMetadata(t *testing.T) {
 		assert.Nil(t, err)
 	})
 
-	t.Run("invalid nullable autoDeleteOnIdleInSec", func(t *testing.T) {
-		fakeProperties := getFakeProperties()
-		fakeProperties[keyAutoDeleteOnIdleInSec] = invalidNumber
-
-		// act.
-		_, err := ParseMetadata(fakeProperties, nil, 0)
-
-		// assert.
-		assert.Error(t, err)
-	})
-
 	t.Run("missing nullable lockDurationInSec", func(t *testing.T) {
 		fakeProperties := getFakeProperties()
-		fakeProperties[keyLockDurationInSec] = ""
+		delete(fakeProperties, keyLockDurationInSec)
 
 		// act.
 		m, err := ParseMetadata(fakeProperties, nil, 0)
@@ -549,14 +507,28 @@ func TestParseServiceBusMetadata(t *testing.T) {
 		assert.Nil(t, err)
 	})
 
-	t.Run("invalid nullable lockDurationInSec", func(t *testing.T) {
-		fakeProperties := getFakeProperties()
-		fakeProperties[keyLockDurationInSec] = invalidNumber
+	t.Run("Test add system metadata: ScheduledEnqueueTimeUtc", func(t *testing.T) {
+		msg := azservicebus.Message{}
+		metadata := map[string]string{
+			MessageKeyScheduledEnqueueTimeUtc: "2024-06-15T13:45:30.00000000Z",
+		}
+		parseErr := addMetadataToMessage(&msg, metadata)
+		assert.NoError(t, parseErr)
+		assert.Equal(t, int64(1718459130000000), msg.ScheduledEnqueueTime.UnixMicro())
 
-		// act.
-		_, err := ParseMetadata(fakeProperties, nil, 0)
+		msg2 := azservicebus.Message{}
+		metadata2 := map[string]string{
+			MessageKeyScheduledEnqueueTimeUtc: "Sat, 15 Jun 2024 13:45:30 GMT",
+		}
+		parseErr2 := addMetadataToMessage(&msg2, metadata2)
+		assert.NoError(t, parseErr2)
+		assert.Equal(t, int64(1718459130000000), msg2.ScheduledEnqueueTime.UnixMicro())
 
-		// assert.
-		assert.Error(t, err)
+		msg3 := azservicebus.Message{}
+		metadata3 := map[string]string{
+			MessageKeyScheduledEnqueueTimeUtc: "Sat 2024-06-15 12:13:14 UTC+4",
+		}
+		parseErr3 := addMetadataToMessage(&msg3, metadata3)
+		assert.Error(t, parseErr3)
 	})
 }

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/dapr/components-contrib/internal/eventbus"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/kit/logger"
 )
@@ -109,4 +110,9 @@ func (a *bus) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, handle
 	}()
 
 	return nil
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (a *bus) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
+	return
 }

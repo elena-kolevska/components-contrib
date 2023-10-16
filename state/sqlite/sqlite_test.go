@@ -48,7 +48,7 @@ func TestGetConnectionString(t *testing.T) {
 		db.metadata.reset()
 		db.metadata.ConnectionString = "file:test.db"
 
-		connString, err := db.getConnectionString()
+		connString, err := db.metadata.GetConnectionString(log)
 		require.NoError(t, err)
 
 		values := url.Values{
@@ -64,7 +64,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "test.db"
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -82,7 +82,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = ":memory:"
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -103,7 +103,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "file:test.db?_txlock=immediate"
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -121,7 +121,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "file:test.db?_txlock=deferred"
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -141,7 +141,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "file:test.db?_pragma=busy_timeout(50)"
 
-			_, err := db.getConnectionString()
+			_, err := db.metadata.GetConnectionString(log)
 			require.Error(t, err)
 			assert.ErrorContains(t, err, "found forbidden option '_pragma=busy_timeout' in the connection string")
 		})
@@ -150,7 +150,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "file:test.db?_pragma=journal_mode(WAL)"
 
-			_, err := db.getConnectionString()
+			_, err := db.metadata.GetConnectionString(log)
 			require.Error(t, err)
 			assert.ErrorContains(t, err, "found forbidden option '_pragma=journal_mode' in the connection string")
 		})
@@ -162,7 +162,7 @@ func TestGetConnectionString(t *testing.T) {
 		db.metadata.ConnectionString = "file:test.db"
 		db.metadata.BusyTimeout = time.Second
 
-		connString, err := db.getConnectionString()
+		connString, err := db.metadata.GetConnectionString(log)
 		require.NoError(t, err)
 
 		values := url.Values{
@@ -179,7 +179,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.ConnectionString = "file:test.db"
 			db.metadata.DisableWAL = false
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -195,7 +195,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.ConnectionString = "file:test.db"
 			db.metadata.DisableWAL = true
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -210,7 +210,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "file::memory:"
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -226,7 +226,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "file:test.db?mode=ro"
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -242,7 +242,7 @@ func TestGetConnectionString(t *testing.T) {
 			db.metadata.reset()
 			db.metadata.ConnectionString = "file:test.db?immutable=1"
 
-			connString, err := db.getConnectionString()
+			connString, err := db.metadata.GetConnectionString(log)
 			require.NoError(t, err)
 
 			values := url.Values{
@@ -275,32 +275,20 @@ func TestMultiWithNoRequestsReturnsNil(t *testing.T) {
 
 func TestValidSetRequest(t *testing.T) {
 	t.Parallel()
-	var operations []state.TransactionalStateOperation
-
-	operations = append(operations, state.TransactionalStateOperation{
-		Operation: state.Upsert,
-		Request:   createSetRequest(),
-	})
 
 	ods := createSqlite(t)
 	err := ods.Multi(context.Background(), &state.TransactionalStateRequest{
-		Operations: operations,
+		Operations: []state.TransactionalStateOperation{createSetRequest()},
 	})
 	assert.NoError(t, err)
 }
 
 func TestValidMultiDeleteRequest(t *testing.T) {
 	t.Parallel()
-	var operations []state.TransactionalStateOperation
-
-	operations = append(operations, state.TransactionalStateOperation{
-		Operation: state.Delete,
-		Request:   createDeleteRequest(),
-	})
 
 	ods := createSqlite(t)
 	err := ods.Multi(context.Background(), &state.TransactionalStateRequest{
-		Operations: operations,
+		Operations: []state.TransactionalStateOperation{createDeleteRequest()},
 	})
 	assert.NoError(t, err)
 }
@@ -342,6 +330,10 @@ func (m *fakeDBaccess) Set(ctx context.Context, req *state.SetRequest) error {
 func (m *fakeDBaccess) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	m.getExecuted = true
 
+	return nil, nil
+}
+
+func (m *fakeDBaccess) BulkGet(parentCtx context.Context, req []state.GetRequest) ([]state.BulkGetResponse, error) {
 	return nil, nil
 }
 

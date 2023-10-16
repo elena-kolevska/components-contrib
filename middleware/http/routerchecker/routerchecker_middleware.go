@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
 	"regexp"
 
 	"github.com/dapr/components-contrib/internal/httputils"
@@ -27,7 +28,7 @@ import (
 
 // Metadata is the routerchecker middleware config.
 type Metadata struct {
-	Rule string `json:"rule"`
+	Rule string `json:"rule" mapstructure:"rule"`
 }
 
 // NewRouterCheckerMiddleware returns a new routerchecker middleware.
@@ -71,4 +72,10 @@ func (m *Middleware) getNativeMetadata(metadata middleware.Metadata) (*Metadata,
 		return nil, err
 	}
 	return &middlewareMetadata, nil
+}
+
+func (m *Middleware) GetComponentMetadata() (metadataInfo mdutils.MetadataMap) {
+	metadataStruct := Metadata{}
+	mdutils.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, mdutils.MiddlewareType)
+	return
 }

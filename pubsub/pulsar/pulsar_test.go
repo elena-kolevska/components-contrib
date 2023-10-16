@@ -44,7 +44,7 @@ func TestParsePulsarMetadata(t *testing.T) {
 	assert.Equal(t, 5*time.Second, meta.BatchingMaxPublishDelay)
 	assert.Equal(t, uint(100), meta.BatchingMaxSize)
 	assert.Equal(t, uint(200), meta.BatchingMaxMessages)
-	assert.Empty(t, meta.topicSchemas)
+	assert.Empty(t, meta.internalTopicSchemas)
 }
 
 func TestParsePulsarSchemaMetadata(t *testing.T) {
@@ -59,9 +59,9 @@ func TestParsePulsarSchemaMetadata(t *testing.T) {
 
 		assert.Nil(t, err)
 		assert.Equal(t, "a", meta.Host)
-		assert.Len(t, meta.topicSchemas, 2)
-		assert.Equal(t, "1", meta.topicSchemas["obiwan"].value)
-		assert.Equal(t, "2", meta.topicSchemas["kenobi.jsonschema"].value)
+		assert.Len(t, meta.internalTopicSchemas, 2)
+		assert.Equal(t, "1", meta.internalTopicSchemas["obiwan"].value)
+		assert.Equal(t, "2", meta.internalTopicSchemas["kenobi.jsonschema"].value)
 	})
 
 	t.Run("test avro", func(t *testing.T) {
@@ -75,9 +75,25 @@ func TestParsePulsarSchemaMetadata(t *testing.T) {
 
 		assert.Nil(t, err)
 		assert.Equal(t, "a", meta.Host)
-		assert.Len(t, meta.topicSchemas, 2)
-		assert.Equal(t, "1", meta.topicSchemas["obiwan"].value)
-		assert.Equal(t, "2", meta.topicSchemas["kenobi.avroschema"].value)
+		assert.Len(t, meta.internalTopicSchemas, 2)
+		assert.Equal(t, "1", meta.internalTopicSchemas["obiwan"].value)
+		assert.Equal(t, "2", meta.internalTopicSchemas["kenobi.avroschema"].value)
+	})
+
+	t.Run("test proto", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{
+			"host":                           "a",
+			"obiwan.avroschema":              "1",
+			"kenobi.protoschema.protoschema": "2",
+		}
+		meta, err := parsePulsarMetadata(m)
+
+		assert.NoError(t, err)
+		assert.Equal(t, "a", meta.Host)
+		assert.Len(t, meta.internalTopicSchemas, 2)
+		assert.Equal(t, "1", meta.internalTopicSchemas["obiwan"].value)
+		assert.Equal(t, "2", meta.internalTopicSchemas["kenobi.protoschema"].value)
 	})
 
 	t.Run("test combined avro/json", func(t *testing.T) {
@@ -91,11 +107,32 @@ func TestParsePulsarSchemaMetadata(t *testing.T) {
 
 		assert.Nil(t, err)
 		assert.Equal(t, "a", meta.Host)
-		assert.Len(t, meta.topicSchemas, 2)
-		assert.Equal(t, "1", meta.topicSchemas["obiwan"].value)
-		assert.Equal(t, "2", meta.topicSchemas["kenobi"].value)
-		assert.Equal(t, avroProtocol, meta.topicSchemas["obiwan"].protocol)
-		assert.Equal(t, jsonProtocol, meta.topicSchemas["kenobi"].protocol)
+		assert.Len(t, meta.internalTopicSchemas, 2)
+		assert.Equal(t, "1", meta.internalTopicSchemas["obiwan"].value)
+		assert.Equal(t, "2", meta.internalTopicSchemas["kenobi"].value)
+		assert.Equal(t, avroProtocol, meta.internalTopicSchemas["obiwan"].protocol)
+		assert.Equal(t, jsonProtocol, meta.internalTopicSchemas["kenobi"].protocol)
+	})
+
+	t.Run("test combined avro/json/proto", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{
+			"host":              "a",
+			"obiwan.avroschema": "1",
+			"kenobi.jsonschema": "2",
+			"darth.protoschema": "3",
+		}
+		meta, err := parsePulsarMetadata(m)
+
+		assert.Nil(t, err)
+		assert.Equal(t, "a", meta.Host)
+		assert.Len(t, meta.internalTopicSchemas, 3)
+		assert.Equal(t, "1", meta.internalTopicSchemas["obiwan"].value)
+		assert.Equal(t, "2", meta.internalTopicSchemas["kenobi"].value)
+		assert.Equal(t, "3", meta.internalTopicSchemas["darth"].value)
+		assert.Equal(t, avroProtocol, meta.internalTopicSchemas["obiwan"].protocol)
+		assert.Equal(t, jsonProtocol, meta.internalTopicSchemas["kenobi"].protocol)
+		assert.Equal(t, protoProtocol, meta.internalTopicSchemas["darth"].protocol)
 	})
 
 	t.Run("test funky edge case", func(t *testing.T) {
@@ -108,8 +145,8 @@ func TestParsePulsarSchemaMetadata(t *testing.T) {
 
 		assert.Nil(t, err)
 		assert.Equal(t, "a", meta.Host)
-		assert.Len(t, meta.topicSchemas, 1)
-		assert.Equal(t, "1", meta.topicSchemas["obiwan.jsonschema"].value)
+		assert.Len(t, meta.internalTopicSchemas, 1)
+		assert.Equal(t, "1", meta.internalTopicSchemas["obiwan.jsonschema"].value)
 	})
 }
 
@@ -158,14 +195,14 @@ func TestMissingHost(t *testing.T) {
 	assert.Equal(t, "pulsar error: missing pulsar host", err.Error())
 }
 
-func TestInvalidTLSInput(t *testing.T) {
+func TestInvalidTLSInputDefaultsToFalse(t *testing.T) {
 	m := pubsub.Metadata{}
 	m.Properties = map[string]string{"host": "a", "enableTLS": "honk"}
 	meta, err := parsePulsarMetadata(m)
 
-	assert.Error(t, err)
-	assert.Nil(t, meta)
-	assert.Equal(t, "pulsar error: invalid value for enableTLS", err.Error())
+	assert.NoError(t, err)
+	assert.NotNil(t, meta)
+	assert.False(t, meta.EnableTLS)
 }
 
 func TestValidTenantAndNS(t *testing.T) {
@@ -206,5 +243,85 @@ func TestValidTenantAndNS(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Equal(t, false, meta.Persistent)
 		assert.Equal(t, expectNonPersistentResult, res)
+	})
+}
+
+func TestEncryptionKeys(t *testing.T) {
+	m := pubsub.Metadata{}
+	m.Properties = map[string]string{"host": "a", "privateKey": "111", "publicKey": "222", "keys": "a,b"}
+
+	t.Run("test encryption metadata", func(t *testing.T) {
+		meta, err := parsePulsarMetadata(m)
+
+		assert.Nil(t, err)
+		assert.Equal(t, "111", meta.PrivateKey)
+		assert.Equal(t, "222", meta.PublicKey)
+		assert.Equal(t, "a,b", meta.Keys)
+	})
+
+	t.Run("test valid producer encryption", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{"host": "a", "publicKey": "222", "keys": "a,b"}
+
+		meta, _ := parsePulsarMetadata(m)
+		p := &Pulsar{metadata: *meta}
+		r := p.useProducerEncryption()
+
+		assert.True(t, r)
+	})
+
+	t.Run("test invalid producer encryption missing public key", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{"host": "a", "keys": "a,b"}
+
+		meta, _ := parsePulsarMetadata(m)
+		p := &Pulsar{metadata: *meta}
+		r := p.useProducerEncryption()
+
+		assert.False(t, r)
+	})
+
+	t.Run("test invalid producer encryption missing keys", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{"host": "a", "publicKey": "222"}
+
+		meta, _ := parsePulsarMetadata(m)
+		p := &Pulsar{metadata: *meta}
+		r := p.useProducerEncryption()
+
+		assert.False(t, r)
+	})
+
+	t.Run("test valid consumer encryption", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{"host": "a", "privateKey": "222", "publicKey": "333"}
+
+		meta, _ := parsePulsarMetadata(m)
+		p := &Pulsar{metadata: *meta}
+		r := p.useConsumerEncryption()
+
+		assert.True(t, r)
+	})
+
+	t.Run("test invalid consumer encryption missing public key", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{"host": "a", "privateKey": "222"}
+
+		meta, _ := parsePulsarMetadata(m)
+		p := &Pulsar{metadata: *meta}
+		r := p.useConsumerEncryption()
+
+		assert.False(t, r)
+	})
+
+	t.Run("test invalid producer encryption missing private key", func(t *testing.T) {
+		m := pubsub.Metadata{}
+		m.Properties = map[string]string{"host": "a", "privateKey": "222"}
+
+		meta, _ := parsePulsarMetadata(m)
+		p := &Pulsar{metadata: *meta}
+		r := p.useConsumerEncryption()
+
+		assert.False(t, r)
 	})
 }

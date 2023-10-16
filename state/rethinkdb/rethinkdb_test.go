@@ -17,12 +17,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/dapr/components-contrib/internal/utils"
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
@@ -67,7 +69,9 @@ func TestRethinkDBStateStore(t *testing.T) {
 	}
 
 	m := state.Metadata{Base: metadata.Base{Properties: getTestMetadata()}}
-	db := NewRethinkDBStateStore(logger.NewLogger("test")).(*RethinkDB)
+	db := &RethinkDB{
+		logger: logger.NewLogger("test"),
+	}
 
 	t.Run("With init", func(t *testing.T) {
 		if err := db.Init(context.Background(), m); err != nil {
@@ -156,17 +160,20 @@ func TestRethinkDBStateStoreRongRun(t *testing.T) {
 	}
 
 	m := state.Metadata{Base: metadata.Base{Properties: getTestMetadata()}}
-	db := NewRethinkDBStateStore(logger.NewLogger("test")).(*RethinkDB)
+	db := NewRethinkDBStateStore(logger.NewLogger("test"))
 	if err := db.Init(context.Background(), m); err != nil {
 		t.Fatalf("error initializing db: %v", err)
 	}
+	closer, ok := db.(io.Closer)
+	assert.True(t, ok)
+	defer assert.NoError(t, closer.Close())
 
 	for i := 0; i < 1000; i++ {
 		testBulk(t, db, i)
 	}
 }
 
-func testBulk(t *testing.T, db *RethinkDB, i int) {
+func testBulk(t *testing.T, db state.Store, i int) {
 	// create data list
 	deleteList := make([]state.DeleteRequest, 0)
 	setList := make([]state.SetRequest, 3)
@@ -178,104 +185,30 @@ func testBulk(t *testing.T, db *RethinkDB, i int) {
 	}
 
 	// bulk set it
-	if err := db.BulkSet(context.Background(), setList); err != nil {
+	if err := db.BulkSet(context.Background(), setList, state.BulkStoreOpts{}); err != nil {
 		t.Fatalf("error setting data to db: %v -- run %d", err, i)
 	}
 
 	// check for the data
 	for _, v := range deleteList {
 		resp, err := db.Get(context.Background(), &state.GetRequest{Key: v.Key})
-		assert.Nilf(t, err, " -- run %d", i)
+		assert.NoErrorf(t, err, " -- run %d", i)
 		assert.NotNil(t, resp)
 		assert.NotNil(t, resp.Data)
 	}
 
 	// delete data
-	if err := db.BulkDelete(context.Background(), deleteList); err != nil {
+	if err := db.BulkDelete(context.Background(), deleteList, state.BulkStoreOpts{}); err != nil {
 		t.Fatalf("error on data deletion: %v -- run %d", err, i)
 	}
 
 	// check for the data NOT being there
 	for _, v := range deleteList {
 		resp, err := db.Get(context.Background(), &state.GetRequest{Key: v.Key})
-		assert.Nilf(t, err, " -- run %d", i)
+		assert.NoErrorf(t, err, " -- run %d", i)
 		assert.NotNil(t, resp)
 		assert.Nil(t, resp.Data)
 	}
-}
-
-// go test -timeout 30s github.com/dapr/components-contrib/state/rethinkdb -run ^TestRethinkDBStateStoreMulti$ -count 1 -v.
-func TestRethinkDBStateStoreMulti(t *testing.T) {
-	if !isLiveTest() {
-		t.SkipNow()
-	}
-
-	m := state.Metadata{Base: metadata.Base{Properties: getTestMetadata()}}
-	db := NewRethinkDBStateStore(logger.NewLogger("test")).(*RethinkDB)
-	if err := db.Init(context.Background(), m); err != nil {
-		t.Fatalf("error initializing db: %v", err)
-	}
-
-	numOfRecords := 4
-	recordIDFormat := "multi-%d"
-	t.Run("With multi", func(t *testing.T) {
-		// create data list
-		d := []byte("test")
-		list := make([]state.SetRequest, numOfRecords)
-		for i := 0; i < numOfRecords; i++ {
-			list[i] = state.SetRequest{Key: fmt.Sprintf(recordIDFormat, i), Value: d}
-		}
-		if err := db.BulkSet(context.Background(), list); err != nil {
-			t.Fatalf("error setting multi to db: %v", err)
-		}
-
-		// test multi
-		d2 := []byte("test")
-		req := &state.TransactionalStateRequest{
-			Operations: []state.TransactionalStateOperation{
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   fmt.Sprintf(recordIDFormat, 0),
-						Value: d2,
-					},
-				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   fmt.Sprintf(recordIDFormat, 1),
-						Value: d2,
-					},
-				},
-				{
-					Operation: state.Delete,
-					Request:   state.DeleteRequest{Key: fmt.Sprintf(recordIDFormat, 2)},
-				},
-				{
-					Operation: state.Delete,
-					Request:   state.DeleteRequest{Key: fmt.Sprintf(recordIDFormat, 3)},
-				},
-			},
-		}
-
-		// execute multi
-		if err := db.Multi(context.Background(), req); err != nil {
-			t.Fatalf("error setting multi to db: %v", err)
-		}
-
-		// the one not deleted should be still there
-		m1, err := db.Get(context.Background(), &state.GetRequest{Key: fmt.Sprintf(recordIDFormat, 1)})
-		assert.Nil(t, err)
-		assert.NotNil(t, m1)
-		assert.NotNil(t, m1.Data)
-		assert.Equal(t, string(d2), string(m1.Data))
-
-		// the one deleted should not
-		m2, err := db.Get(context.Background(), &state.GetRequest{Key: fmt.Sprintf(recordIDFormat, 3)})
-		assert.Nil(t, err)
-		assert.NotNil(t, m2)
-		assert.Nil(t, m2.Data)
-	})
 }
 
 type testObj struct {
@@ -298,7 +231,7 @@ func testGetTestObj(t *testing.T, resp *state.GetResponse) *testObj {
 }
 
 func isLiveTest() bool {
-	return os.Getenv("RUN_LIVE_RETHINKDB_TEST") == "true"
+	return utils.IsTruthy(os.Getenv("RUN_LIVE_RETHINKDB_TEST"))
 }
 
 func getTestMetadata() map[string]string {

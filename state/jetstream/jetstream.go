@@ -15,28 +15,31 @@ package jetstream
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"io"
 	"reflect"
 	"strings"
+	"sync/atomic"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/components-contrib/state/utils"
 	"github.com/dapr/kit/logger"
-
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nkeys"
 )
 
 // StateStore is a nats jetstream KV state store.
 type StateStore struct {
-	state.DefaultBulkStore
+	state.BulkStore
+
 	nc     *nats.Conn
 	json   jsoniter.API
 	bucket nats.KeyValue
 	logger logger.Logger
+	closed atomic.Bool
 }
 
 type jetstreamMetadata struct {
@@ -53,8 +56,7 @@ func NewJetstreamStateStore(logger logger.Logger) state.Store {
 		json:   jsoniter.ConfigFastest,
 		logger: logger,
 	}
-	s.DefaultBulkStore = state.NewDefaultBulkStore(s)
-
+	s.BulkStore = state.NewDefaultBulkStore(s)
 	return s
 }
 
@@ -131,15 +133,15 @@ func (js *StateStore) getMetadata(meta state.Metadata) (jetstreamMetadata, error
 	}
 
 	if m.NatsURL == "" {
-		return jetstreamMetadata{}, fmt.Errorf("missing nats URL")
+		return jetstreamMetadata{}, errors.New("missing nats URL")
 	}
 
 	if m.Jwt != "" && m.SeedKey == "" {
-		return jetstreamMetadata{}, fmt.Errorf("missing seed key")
+		return jetstreamMetadata{}, errors.New("missing seed key")
 	}
 
 	if m.Jwt == "" && m.SeedKey != "" {
-		return jetstreamMetadata{}, fmt.Errorf("missing jwt")
+		return jetstreamMetadata{}, errors.New("missing jwt")
 	}
 
 	if m.Name == "" {
@@ -147,7 +149,7 @@ func (js *StateStore) getMetadata(meta state.Metadata) (jetstreamMetadata, error
 	}
 
 	if m.Bucket == "" {
-		return jetstreamMetadata{}, fmt.Errorf("missing bucket")
+		return jetstreamMetadata{}, errors.New("missing bucket")
 	}
 
 	return m, nil
@@ -171,9 +173,17 @@ func escape(key string) string {
 	return strings.ReplaceAll(key, "||", ".")
 }
 
-func (js *StateStore) GetComponentMetadata() map[string]string {
+func (js *StateStore) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
 	metadataStruct := jetstreamMetadata{}
-	metadataInfo := map[string]string{}
-	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
-	return metadataInfo
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.StateStoreType)
+	return
 }
+
+func (js *StateStore) Close() error {
+	if js.closed.CompareAndSwap(false, true) && js.nc != nil {
+		js.nc.Close()
+	}
+	return nil
+}
+
+var _ io.Closer = (*StateStore)(nil)

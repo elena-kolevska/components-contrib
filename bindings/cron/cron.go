@@ -17,13 +17,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/benbjohnson/clock"
+	"k8s.io/utils/clock"
 
 	"github.com/dapr/components-contrib/bindings"
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	cron "github.com/dapr/kit/cron"
 	"github.com/dapr/kit/logger"
 )
@@ -40,9 +42,13 @@ type Binding struct {
 	wg       sync.WaitGroup
 }
 
+type metadata struct {
+	Schedule string
+}
+
 // NewCron returns a new Cron event input binding.
 func NewCron(logger logger.Logger) bindings.InputBinding {
-	return NewCronWithClock(logger, clock.New())
+	return NewCronWithClock(logger, clock.RealClock{})
 }
 
 func NewCronWithClock(logger logger.Logger, clk clock.Clock) bindings.InputBinding {
@@ -61,17 +67,21 @@ func NewCronWithClock(logger logger.Logger, clk clock.Clock) bindings.InputBindi
 //
 //	"15 * * * * *" - Every 15 sec
 //	"0 30 * * * *" - Every 30 min
-func (b *Binding) Init(ctx context.Context, metadata bindings.Metadata) error {
-	b.name = metadata.Name
-	s, f := metadata.Properties["schedule"]
-	if !f || s == "" {
+func (b *Binding) Init(ctx context.Context, meta bindings.Metadata) error {
+	b.name = meta.Name
+	m := metadata{}
+	err := contribMetadata.DecodeMetadata(meta.Properties, &m)
+	if err != nil {
+		return err
+	}
+	if m.Schedule == "" {
 		return fmt.Errorf("schedule not set")
 	}
-	_, err := b.parser.Parse(s)
+	_, err = b.parser.Parse(m.Schedule)
 	if err != nil {
-		return fmt.Errorf("invalid schedule format '%s': %w", s, err)
+		return fmt.Errorf("invalid schedule format '%s': %w", m.Schedule, err)
 	}
-	b.schedule = s
+	b.schedule = m.Schedule
 
 	return nil
 }
@@ -119,4 +129,11 @@ func (b *Binding) Close() error {
 	}
 	b.wg.Wait()
 	return nil
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (b *Binding) GetComponentMetadata() (metadataInfo contribMetadata.MetadataMap) {
+	metadataStruct := metadata{}
+	contribMetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, contribMetadata.BindingType)
+	return
 }

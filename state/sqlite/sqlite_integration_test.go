@@ -18,7 +18,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -52,9 +54,9 @@ func TestSqliteIntegration(t *testing.T) {
 		},
 	}
 
-	s := NewSQLiteStateStore(logger.NewLogger("test")).(*SQLiteStore)
+	s := NewSQLiteStateStore(logger.NewLogger("test"))
 	t.Cleanup(func() {
-		defer s.Close()
+		defer s.(io.Closer).Close()
 	})
 
 	if initerror := s.Init(context.Background(), metadata); initerror != nil {
@@ -138,6 +140,11 @@ func TestSqliteIntegration(t *testing.T) {
 		multiWithSetOnly(t, s)
 	})
 
+	t.Run("ttlExpireTime", func(t *testing.T) {
+		getExpireTime(t, s)
+		getBulkExpireTime(t, s)
+	})
+
 	t.Run("Binary data", func(t *testing.T) {
 		key := randomKey()
 
@@ -158,7 +165,7 @@ func TestSqliteIntegration(t *testing.T) {
 }
 
 // setGetUpdateDeleteOneItem validates setting one item, getting it, and deleting it.
-func setGetUpdateDeleteOneItem(t *testing.T, s *SQLiteStore) {
+func setGetUpdateDeleteOneItem(t *testing.T, s state.Store) {
 	key := randomKey()
 	value := &fakeItem{Color: "yellow"}
 
@@ -176,7 +183,7 @@ func setGetUpdateDeleteOneItem(t *testing.T, s *SQLiteStore) {
 	deleteItem(t, s, key, getResponse.ETag)
 }
 
-func deleteItemThatDoesNotExist(t *testing.T, s *SQLiteStore) {
+func deleteItemThatDoesNotExist(t *testing.T, s state.Store) {
 	// Delete the item with a key not in the store.
 	deleteReq := &state.DeleteRequest{
 		Key: randomKey(),
@@ -185,7 +192,7 @@ func deleteItemThatDoesNotExist(t *testing.T, s *SQLiteStore) {
 	assert.NoError(t, err)
 }
 
-func multiWithSetOnly(t *testing.T, s *SQLiteStore) {
+func multiWithSetOnly(t *testing.T, s state.Store) {
 	var operations []state.TransactionalStateOperation
 	var setRequests []state.SetRequest
 	for i := 0; i < 3; i++ {
@@ -194,13 +201,10 @@ func multiWithSetOnly(t *testing.T, s *SQLiteStore) {
 			Value: randomJSON(),
 		}
 		setRequests = append(setRequests, req)
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Upsert,
-			Request:   req,
-		})
+		operations = append(operations, req)
 	}
 
-	err := s.Multi(context.Background(), &state.TransactionalStateRequest{
+	err := s.(state.TransactionalStore).Multi(context.Background(), &state.TransactionalStateRequest{
 		Operations: operations,
 	})
 	assert.NoError(t, err)
@@ -211,7 +215,7 @@ func multiWithSetOnly(t *testing.T, s *SQLiteStore) {
 	}
 }
 
-func multiWithDeleteOnly(t *testing.T, s *SQLiteStore) {
+func multiWithDeleteOnly(t *testing.T, s state.Store) {
 	var operations []state.TransactionalStateOperation
 	var deleteRequests []state.DeleteRequest
 	for i := 0; i < 3; i++ {
@@ -224,13 +228,10 @@ func multiWithDeleteOnly(t *testing.T, s *SQLiteStore) {
 		deleteRequests = append(deleteRequests, req)
 
 		// Add the item to the multi transaction request.
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Delete,
-			Request:   req,
-		})
+		operations = append(operations, req)
 	}
 
-	err := s.Multi(context.Background(), &state.TransactionalStateRequest{
+	err := s.(state.TransactionalStore).Multi(context.Background(), &state.TransactionalStateRequest{
 		Operations: operations,
 	})
 	assert.NoError(t, err)
@@ -240,7 +241,7 @@ func multiWithDeleteOnly(t *testing.T, s *SQLiteStore) {
 	}
 }
 
-func multiWithDeleteAndSet(t *testing.T, s *SQLiteStore) {
+func multiWithDeleteAndSet(t *testing.T, s state.Store) {
 	var operations []state.TransactionalStateOperation
 	var deleteRequests []state.DeleteRequest
 	for i := 0; i < 3; i++ {
@@ -253,10 +254,7 @@ func multiWithDeleteAndSet(t *testing.T, s *SQLiteStore) {
 		deleteRequests = append(deleteRequests, req)
 
 		// Add the item to the multi transaction request.
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Delete,
-			Request:   req,
-		})
+		operations = append(operations, req)
 	}
 
 	// Create the set requests.
@@ -267,13 +265,10 @@ func multiWithDeleteAndSet(t *testing.T, s *SQLiteStore) {
 			Value: randomJSON(),
 		}
 		setRequests = append(setRequests, req)
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Upsert,
-			Request:   req,
-		})
+		operations = append(operations, req)
 	}
 
-	err := s.Multi(context.Background(), &state.TransactionalStateRequest{
+	err := s.(state.TransactionalStore).Multi(context.Background(), &state.TransactionalStateRequest{
 		Operations: operations,
 	})
 	assert.NoError(t, err)
@@ -288,7 +283,7 @@ func multiWithDeleteAndSet(t *testing.T, s *SQLiteStore) {
 	}
 }
 
-func deleteWithInvalidEtagFails(t *testing.T, s *SQLiteStore) {
+func deleteWithInvalidEtagFails(t *testing.T, s state.Store) {
 	// Create new item.
 	key := randomKey()
 	value := &fakeItem{Color: "mauvebrown"}
@@ -307,7 +302,7 @@ func deleteWithInvalidEtagFails(t *testing.T, s *SQLiteStore) {
 	assert.NotNil(t, err, "Deleting an item with the wrong etag while enforcing FirstWrite policy should fail")
 }
 
-func deleteWithNoKeyFails(t *testing.T, s *SQLiteStore) {
+func deleteWithNoKeyFails(t *testing.T, s state.Store) {
 	deleteReq := &state.DeleteRequest{
 		Key: "",
 	}
@@ -316,7 +311,7 @@ func deleteWithNoKeyFails(t *testing.T, s *SQLiteStore) {
 }
 
 // newItemWithEtagFails creates a new item and also supplies a non existent ETag and requests FirstWrite, which is invalid - expect failure.
-func newItemWithEtagFails(t *testing.T, s *SQLiteStore) {
+func newItemWithEtagFails(t *testing.T, s state.Store) {
 	value := &fakeItem{Color: "teal"}
 	invalidEtag := "12345"
 
@@ -333,7 +328,7 @@ func newItemWithEtagFails(t *testing.T, s *SQLiteStore) {
 	assert.Error(t, err)
 }
 
-func updateWithOldEtagFails(t *testing.T, s *SQLiteStore) {
+func updateWithOldEtagFails(t *testing.T, s state.Store) {
 	// Create and retrieve new item.
 	key := randomKey()
 	value := &fakeItem{Color: "gray"}
@@ -363,7 +358,7 @@ func updateWithOldEtagFails(t *testing.T, s *SQLiteStore) {
 	assert.Error(t, err)
 }
 
-func updateAndDeleteWithEtagSucceeds(t *testing.T, s *SQLiteStore) {
+func updateAndDeleteWithEtagSucceeds(t *testing.T, s state.Store) {
 	// Create and retrieve new item.
 	key := randomKey()
 	value := &fakeItem{Color: "hazel"}
@@ -405,7 +400,7 @@ func updateAndDeleteWithEtagSucceeds(t *testing.T, s *SQLiteStore) {
 }
 
 // getItemThatDoesNotExist validates the behavior of retrieving an item that does not exist.
-func getItemThatDoesNotExist(t *testing.T, s *SQLiteStore) {
+func getItemThatDoesNotExist(t *testing.T, s state.Store) {
 	key := randomKey()
 	response, outputObject := getItem(t, s, key)
 	assert.Nil(t, response.Data)
@@ -414,7 +409,7 @@ func getItemThatDoesNotExist(t *testing.T, s *SQLiteStore) {
 }
 
 // getItemWithNoKey validates that attempting a Get operation without providing a key will return an error.
-func getItemWithNoKey(t *testing.T, s *SQLiteStore) {
+func getItemWithNoKey(t *testing.T, s state.Store) {
 	getReq := &state.GetRequest{
 		Key: "",
 	}
@@ -425,7 +420,7 @@ func getItemWithNoKey(t *testing.T, s *SQLiteStore) {
 }
 
 // setUpdatesTheUpdatedateField proves that the updateddate is set for an update.
-func setUpdatesTheUpdatedateField(t *testing.T, s *SQLiteStore) {
+func setUpdatesTheUpdatedateField(t *testing.T, s state.Store) {
 	key := randomKey()
 	value := &fakeItem{Color: "orange"}
 	setItem(t, s, key, value, nil)
@@ -447,7 +442,7 @@ func setUpdatesTheUpdatedateField(t *testing.T, s *SQLiteStore) {
 }
 
 // setTTLUpdatesExpiry proves that the expirydate is set when a TTL is passed for a key.
-func setTTLUpdatesExpiry(t *testing.T, s *SQLiteStore) {
+func setTTLUpdatesExpiry(t *testing.T, s state.Store) {
 	key := randomKey()
 	value := &fakeItem{Color: "darkgray"}
 	setOptions := state.SetStateOption{}
@@ -473,7 +468,7 @@ func setTTLUpdatesExpiry(t *testing.T, s *SQLiteStore) {
 }
 
 // setNoTTLUpdatesExpiry proves that the expirydate is reset when a state element with expiration time (TTL) loses TTL upon second set without TTL.
-func setNoTTLUpdatesExpiry(t *testing.T, s *SQLiteStore) {
+func setNoTTLUpdatesExpiry(t *testing.T, s state.Store) {
 	key := randomKey()
 	value := &fakeItem{Color: "darkorange"}
 	setOptions := state.SetStateOption{}
@@ -499,8 +494,67 @@ func setNoTTLUpdatesExpiry(t *testing.T, s *SQLiteStore) {
 	deleteItem(t, s, key, nil)
 }
 
+func getExpireTime(t *testing.T, s state.Store) {
+	key1 := randomKey()
+	assert.NoError(t, s.Set(context.Background(), &state.SetRequest{
+		Key:   key1,
+		Value: "123",
+		Metadata: map[string]string{
+			"ttlInSeconds": "1000",
+		},
+	}))
+
+	resp, err := s.Get(context.Background(), &state.GetRequest{Key: key1})
+	assert.NoError(t, err)
+	assert.Equal(t, `"123"`, string(resp.Data))
+	require.Len(t, resp.Metadata, 1)
+	expireTime, err := time.Parse(time.RFC3339, resp.Metadata["ttlExpireTime"])
+	require.NoError(t, err)
+	assert.InDelta(t, time.Now().Add(time.Second*1000).Unix(), expireTime.Unix(), 10)
+}
+
+func getBulkExpireTime(t *testing.T, s state.Store) {
+	key1 := randomKey()
+	key2 := randomKey()
+
+	assert.NoError(t, s.Set(context.Background(), &state.SetRequest{
+		Key:   key1,
+		Value: "123",
+		Metadata: map[string]string{
+			"ttlInSeconds": "1000",
+		},
+	}))
+	assert.NoError(t, s.Set(context.Background(), &state.SetRequest{
+		Key:   key2,
+		Value: "456",
+		Metadata: map[string]string{
+			"ttlInSeconds": "2001",
+		},
+	}))
+
+	resp, err := s.BulkGet(context.Background(), []state.GetRequest{
+		{Key: key1}, {Key: key2},
+	}, state.BulkGetOpts{})
+	require.NoError(t, err)
+	assert.Len(t, resp, 2)
+	sort.Slice(resp, func(i, j int) bool {
+		return string(resp[i].Data) < string(resp[j].Data)
+	})
+
+	assert.Equal(t, `"123"`, string(resp[0].Data))
+	assert.Equal(t, `"456"`, string(resp[1].Data))
+	require.Len(t, resp[0].Metadata, 1)
+	require.Len(t, resp[1].Metadata, 1)
+	expireTime, err := time.Parse(time.RFC3339, resp[0].Metadata["ttlExpireTime"])
+	require.NoError(t, err)
+	assert.InDelta(t, time.Now().Add(time.Second*1000).Unix(), expireTime.Unix(), 10)
+	expireTime, err = time.Parse(time.RFC3339, resp[1].Metadata["ttlExpireTime"])
+	require.NoError(t, err)
+	assert.InDelta(t, time.Now().Add(time.Second*2001).Unix(), expireTime.Unix(), 10)
+}
+
 // expiredStateCannotBeRead proves that an expired state element can not be read.
-func expiredStateCannotBeRead(t *testing.T, s *SQLiteStore) {
+func expiredStateCannotBeRead(t *testing.T, s state.Store) {
 	key := randomKey()
 	value := &fakeItem{Color: "darkgray"}
 	setOptions := state.SetStateOption{}
@@ -525,7 +579,7 @@ func expiredStateCannotBeRead(t *testing.T, s *SQLiteStore) {
 }
 
 // unexpiredStateCanBeRead proves that a state element with TTL - but no yet expired - can be read.
-func unexpiredStateCanBeRead(t *testing.T, s *SQLiteStore) {
+func unexpiredStateCanBeRead(t *testing.T, s state.Store) {
 	key := randomKey()
 	value := &fakeItem{Color: "dark white"}
 	setOptions := state.SetStateOption{}
@@ -547,7 +601,7 @@ func unexpiredStateCanBeRead(t *testing.T, s *SQLiteStore) {
 	deleteItem(t, s, key, nil)
 }
 
-func setItemWithNoKey(t *testing.T, s *SQLiteStore) {
+func setItemWithNoKey(t *testing.T, s state.Store) {
 	setReq := &state.SetRequest{
 		Key: "",
 	}
@@ -556,7 +610,7 @@ func setItemWithNoKey(t *testing.T, s *SQLiteStore) {
 	assert.Error(t, err)
 }
 
-func testSetItemWithInvalidTTL(t *testing.T, s *SQLiteStore) {
+func testSetItemWithInvalidTTL(t *testing.T, s state.Store) {
 	setReq := &state.SetRequest{
 		Key:   randomKey(),
 		Value: &fakeItem{Color: "oceanblue"},
@@ -568,7 +622,7 @@ func testSetItemWithInvalidTTL(t *testing.T, s *SQLiteStore) {
 	assert.NotNil(t, err, "Setting a value with a proper key and a incorrect TTL value should be produce an error")
 }
 
-func testSetItemWithNegativeTTL(t *testing.T, s *SQLiteStore) {
+func testSetItemWithNegativeTTL(t *testing.T, s state.Store) {
 	setReq := &state.SetRequest{
 		Key:   randomKey(),
 		Value: &fakeItem{Color: "oceanblue"},
@@ -581,7 +635,7 @@ func testSetItemWithNegativeTTL(t *testing.T, s *SQLiteStore) {
 }
 
 // Tests valid bulk sets and deletes.
-func testBulkSetAndBulkDelete(t *testing.T, s *SQLiteStore) {
+func testBulkSetAndBulkDelete(t *testing.T, s state.Store) {
 	setReq := []state.SetRequest{
 		{
 			Key:   randomKey(),
@@ -593,7 +647,7 @@ func testBulkSetAndBulkDelete(t *testing.T, s *SQLiteStore) {
 		},
 	}
 
-	err := s.BulkSet(context.Background(), setReq)
+	err := s.BulkSet(context.Background(), setReq, state.BulkStoreOpts{})
 	assert.NoError(t, err)
 	assert.True(t, storeItemExists(t, s, setReq[0].Key))
 	assert.True(t, storeItemExists(t, s, setReq[1].Key))
@@ -607,7 +661,7 @@ func testBulkSetAndBulkDelete(t *testing.T, s *SQLiteStore) {
 		},
 	}
 
-	err = s.BulkDelete(context.Background(), deleteReq)
+	err = s.BulkDelete(context.Background(), deleteReq, state.BulkStoreOpts{})
 	assert.NoError(t, err)
 	assert.False(t, storeItemExists(t, s, setReq[0].Key))
 	assert.False(t, storeItemExists(t, s, setReq[1].Key))
@@ -624,7 +678,7 @@ func testInitConfiguration(t *testing.T) {
 		{
 			name:        "Empty",
 			props:       map[string]string{},
-			expectedErr: errMissingConnectionString,
+			expectedErr: "missing connection string",
 		},
 		{
 			name: "Valid connection string",
@@ -638,8 +692,8 @@ func testInitConfiguration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := NewSQLiteStateStore(logger).(*SQLiteStore)
-			defer p.Close()
+			p := NewSQLiteStateStore(logger)
+			defer p.(io.Closer).Close()
 
 			metadata := state.Metadata{
 				Base: metadata.Base{
@@ -649,10 +703,10 @@ func testInitConfiguration(t *testing.T) {
 
 			err := p.Init(context.Background(), metadata)
 			if tt.expectedErr == "" {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			} else {
-				assert.Error(t, err)
-				assert.Equal(t, err.Error(), tt.expectedErr)
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.expectedErr)
 			}
 		})
 	}
@@ -667,7 +721,7 @@ func getConnectionString() string {
 	return s
 }
 
-func setItem(t *testing.T, s *SQLiteStore, key string, value interface{}, etag *string) {
+func setItem(t *testing.T, s state.Store, key string, value interface{}, etag *string) {
 	setOptions := state.SetStateOption{}
 	if etag != nil {
 		setOptions.Concurrency = state.FirstWrite
@@ -683,10 +737,10 @@ func setItem(t *testing.T, s *SQLiteStore, key string, value interface{}, etag *
 	err := s.Set(context.Background(), setReq)
 	assert.NoError(t, err)
 	itemExists := storeItemExists(t, s, key)
-	assert.True(t, itemExists, "Item should exist after set has been executed ")
+	assert.True(t, itemExists, "Item should exist after set has been executed")
 }
 
-func getItem(t *testing.T, s *SQLiteStore, key string) (*state.GetResponse, *fakeItem) {
+func getItem(t *testing.T, s state.Store, key string) (*state.GetResponse, *fakeItem) {
 	getReq := &state.GetRequest{
 		Key:     key,
 		Options: state.GetStateOption{},
@@ -701,7 +755,7 @@ func getItem(t *testing.T, s *SQLiteStore, key string) (*state.GetResponse, *fak
 	return response, outputObject
 }
 
-func deleteItem(t *testing.T, s *SQLiteStore, key string, etag *string) {
+func deleteItem(t *testing.T, s state.Store, key string, etag *string) {
 	deleteReq := &state.DeleteRequest{
 		Key:     key,
 		ETag:    etag,
@@ -713,8 +767,8 @@ func deleteItem(t *testing.T, s *SQLiteStore, key string, etag *string) {
 	assert.False(t, storeItemExists(t, s, key), "item should no longer exist after delete has been performed")
 }
 
-func storeItemExists(t *testing.T, s *SQLiteStore, key string) bool {
-	dba := s.dbaccess.(*sqliteDBAccess)
+func storeItemExists(t *testing.T, s state.Store, key string) bool {
+	dba := s.(interface{ GetDBAccess() *sqliteDBAccess }).GetDBAccess()
 	tableName := dba.metadata.TableName
 	db := dba.db
 	var rowCount int32
@@ -726,8 +780,8 @@ func storeItemExists(t *testing.T, s *SQLiteStore, key string) bool {
 	return exists
 }
 
-func getRowData(t *testing.T, s *SQLiteStore, key string) (returnValue string, updatedate sql.NullString) {
-	dba := s.dbaccess.(*sqliteDBAccess)
+func getRowData(t *testing.T, s state.Store, key string) (returnValue string, updatedate sql.NullString) {
+	dba := s.(interface{ GetDBAccess() *sqliteDBAccess }).GetDBAccess()
 	tableName := dba.metadata.TableName
 	db := dba.db
 	err := db.QueryRow(fmt.Sprintf("SELECT value, update_time FROM %s WHERE key = ?", tableName), key).
@@ -737,8 +791,8 @@ func getRowData(t *testing.T, s *SQLiteStore, key string) (returnValue string, u
 	return returnValue, updatedate
 }
 
-func getTimesForRow(t *testing.T, s *SQLiteStore, key string) (updatedate sql.NullString, expirationtime sql.NullString) {
-	dba := s.dbaccess.(*sqliteDBAccess)
+func getTimesForRow(t *testing.T, s state.Store, key string) (updatedate sql.NullString, expirationtime sql.NullString) {
+	dba := s.(interface{ GetDBAccess() *sqliteDBAccess }).GetDBAccess()
 	tableName := dba.metadata.TableName
 	db := dba.db
 	err := db.QueryRow(fmt.Sprintf("SELECT update_time, expiration_time FROM %s WHERE key = ?", tableName), key).

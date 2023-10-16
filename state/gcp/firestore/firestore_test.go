@@ -41,7 +41,7 @@ func TestGetFirestoreMetadata(t *testing.T) {
 			Base: metadata.Base{Properties: properties},
 		}
 		metadata, err := getFirestoreMetadata(m)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, "service_account", metadata.Type)
 		assert.Equal(t, "myprojectid", metadata.ProjectID)
 		assert.Equal(t, "123", metadata.PrivateKeyID)
@@ -53,7 +53,6 @@ func TestGetFirestoreMetadata(t *testing.T) {
 	t.Run("With incorrect properties", func(t *testing.T) {
 		properties := map[string]string{
 			"type":           "service_account",
-			"project_id":     "myprojectid",
 			"private_key_id": "123",
 			"private_key":    "mykey",
 		}
@@ -61,6 +60,6 @@ func TestGetFirestoreMetadata(t *testing.T) {
 			Base: metadata.Base{Properties: properties},
 		}
 		_, err := getFirestoreMetadata(m)
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	})
 }

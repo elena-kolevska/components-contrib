@@ -15,11 +15,13 @@ package eventhubs
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs"
 
 	"github.com/dapr/components-contrib/bindings"
 	impl "github.com/dapr/components-contrib/internal/component/azure/eventhubs"
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 	"github.com/dapr/kit/ptr"
 )
@@ -79,16 +81,26 @@ func (a *AzureEventHubs) Invoke(ctx context.Context, req *bindings.InvokeRequest
 func (a *AzureEventHubs) Read(ctx context.Context, handler bindings.Handler) error {
 	// Start the subscription
 	// This is non-blocking
-	return a.AzureEventHubs.Subscribe(ctx, a.AzureEventHubs.EventHubName(), false, func(ctx context.Context, data []byte, metadata map[string]string) error {
-		res := bindings.ReadResponse{
-			Data:     data,
-			Metadata: metadata,
-		}
-		_, hErr := handler(ctx, &res)
-		return hErr
+	topic := a.AzureEventHubs.EventHubName()
+	bindingsHandler := a.AzureEventHubs.GetBindingsHandlerFunc(topic, false, handler)
+	// Setting `maxBulkSubCount` to 1 as bindings are not supported for bulk subscriptions
+	// Setting `CheckPointFrequencyPerPartition` to default value of 1
+	return a.AzureEventHubs.Subscribe(ctx, impl.SubscribeConfig{
+		Topic:                           topic,
+		MaxBulkSubCount:                 1,
+		MaxBulkSubAwaitDurationMs:       impl.DefaultMaxBulkSubAwaitDurationMs,
+		CheckPointFrequencyPerPartition: impl.DefaultCheckpointFrequencyPerPartition,
+		Handler:                         bindingsHandler,
 	})
 }
 
 func (a *AzureEventHubs) Close() error {
 	return a.AzureEventHubs.Close()
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (a *AzureEventHubs) GetComponentMetadata() (metadataInfo contribMetadata.MetadataMap) {
+	metadataStruct := impl.AzureEventHubsMetadata{}
+	contribMetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, contribMetadata.BindingType)
+	return
 }

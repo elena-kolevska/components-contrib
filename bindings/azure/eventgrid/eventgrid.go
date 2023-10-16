@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -531,4 +532,11 @@ func (a *AzureEventGrid) subscriptionNeedsUpdating(res armeventgrid.EventSubscri
 
 	// All good
 	return false
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (a *AzureEventGrid) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
+	metadataStruct := azureEventGridMetadata{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.BindingType)
+	return
 }

@@ -17,6 +17,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +27,7 @@ import (
 
 	"github.com/dapr/components-contrib/bindings"
 	impl "github.com/dapr/components-contrib/internal/component/azure/servicebus"
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -176,7 +179,9 @@ func (a *AzureServiceBusQueues) getHandlerFn(handler bindings.Handler) impl.Hand
 		// Passthrough any custom metadata to the handler.
 		for key, val := range msg.ApplicationProperties {
 			if stringVal, ok := val.(string); ok {
-				metadata[key] = stringVal
+				// Escape the key and value to ensure they are valid URL query parameters.
+				// This is necessary for them to be sent as HTTP Metadata.
+				metadata[url.QueryEscape(key)] = url.QueryEscape(stringVal)
 			}
 		}
 
@@ -196,4 +201,12 @@ func (a *AzureServiceBusQueues) Close() (err error) {
 	a.client.Close(a.logger)
 	a.wg.Wait()
 	return nil
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (a *AzureServiceBusQueues) GetComponentMetadata() (metadataInfo contribMetadata.MetadataMap) {
+	metadataStruct := impl.Metadata{}
+	contribMetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, contribMetadata.BindingType)
+	delete(metadataInfo, "consumerID") // only applies to topics, not queues
+	return
 }

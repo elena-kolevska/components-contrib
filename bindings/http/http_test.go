@@ -68,6 +68,7 @@ func (tc TestCase) ToInvokeRequest() bindings.InvokeRequest {
 	}
 
 	requestMetadata["X-Status-Code"] = strconv.Itoa(tc.statusCode)
+	requestMetadata["path"] = tc.path
 
 	return bindings.InvokeRequest{
 		Data:      []byte(tc.input),
@@ -83,6 +84,14 @@ type HTTPHandler struct {
 
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	h.Path = req.URL.Path
+	if strings.TrimPrefix(h.Path, "/") == "large" {
+		// Write 5KB
+		for i := 0; i < 1<<10; i++ {
+			fmt.Fprint(w, "12345")
+		}
+		return
+	}
+
 	h.Headers = make(map[string]string)
 	for headerKey, headerValue := range req.Header {
 		h.Headers[headerKey] = headerValue[0]
@@ -278,7 +287,7 @@ func InitBindingForHTTPS(s *httptest.Server, extraProps map[string]string) (bind
 	return hs, err
 }
 
-func httpsHandler(w http.ResponseWriter, r *http.Request) {
+func mTLSHandler(w http.ResponseWriter, r *http.Request) {
 	// r.TLS gets ignored by HTTP handlers.
 	// in case where client auth is not required, r.TLS.PeerCertificates will be empty.
 	res := fmt.Sprintf("%v", len(r.TLS.PeerCertificates))
@@ -287,39 +296,71 @@ func httpsHandler(w http.ResponseWriter, r *http.Request) {
 
 func TestDefaultBehaviorHTTPS(t *testing.T) {
 	handler := NewHTTPHandler()
-	server := setupHTTPSServer(t, true, handler)
-	defer server.Close()
+	t.Run("client auth required", func(t *testing.T) {
+		// Passing true to setupHTTPSServer mandates the server to require for client auth.
+		server := setupHTTPSServer(t, true, handler)
+		defer server.Close()
 
-	certMap := map[string]string{
-		"MTLSRootCA":     filepath.Join(".", "testdata", "ca.pem"),
-		"MTLSClientCert": filepath.Join(".", "testdata", "client.pem"),
-		"MTLSClientKey":  filepath.Join(".", "testdata", "client.key"),
-	}
-	hs, err := InitBindingForHTTPS(server, certMap)
-	require.NoError(t, err)
+		certMap := map[string]string{
+			"MTLSRootCA":     filepath.Join(".", "testdata", "ca.pem"),
+			"MTLSClientCert": filepath.Join(".", "testdata", "client.pem"),
+			"MTLSClientKey":  filepath.Join(".", "testdata", "client.key"),
+		}
+		hs, err := InitBindingForHTTPS(server, certMap)
+		require.NoError(t, err)
 
-	verifyDefaultBehaviors(t, hs, handler)
+		verifyDefaultBehaviors(t, hs, handler)
+	})
+	t.Run("client auth not required", func(t *testing.T) {
+		// Passing false to setupHTTPSServer sets up the server with client auth disabled.
+		server := setupHTTPSServer(t, false, handler)
+		defer server.Close()
+
+		certMap := map[string]string{
+			"MTLSRootCA": filepath.Join(".", "testdata", "ca.pem"),
+		}
+		hs, err := InitBindingForHTTPS(server, certMap)
+		require.NoError(t, err)
+
+		verifyDefaultBehaviors(t, hs, handler)
+	})
 }
 
 func TestNon2XXErrorsSuppressedHTTPS(t *testing.T) {
 	handler := NewHTTPHandler()
-	server := setupHTTPSServer(t, true, handler)
-	defer server.Close()
+	t.Run("client auth required", func(t *testing.T) {
+		// Passing true to setupHTTPSServer mandates the server to require for client auth.
+		server := setupHTTPSServer(t, true, handler)
+		defer server.Close()
 
-	certMap := map[string]string{
-		"MTLSRootCA":     filepath.Join(".", "testdata", "ca.pem"),
-		"MTLSClientCert": filepath.Join(".", "testdata", "client.pem"),
-		"MTLSClientKey":  filepath.Join(".", "testdata", "client.key"),
-		"errorIfNot2XX":  "false",
-	}
-	hs, err := InitBindingForHTTPS(server, certMap)
-	require.NoError(t, err)
-	verifyNon2XXErrorsSuppressed(t, hs, handler)
+		certMap := map[string]string{
+			"MTLSRootCA":     filepath.Join(".", "testdata", "ca.pem"),
+			"MTLSClientCert": filepath.Join(".", "testdata", "client.pem"),
+			"MTLSClientKey":  filepath.Join(".", "testdata", "client.key"),
+			"errorIfNot2XX":  "false",
+		}
+		hs, err := InitBindingForHTTPS(server, certMap)
+		require.NoError(t, err)
+		verifyNon2XXErrorsSuppressed(t, hs, handler)
+	})
+	t.Run("client auth not required", func(t *testing.T) {
+		// Passing false to setupHTTPSServer sets up the server with client auth disabled.
+		server := setupHTTPSServer(t, false, handler)
+		defer server.Close()
+
+		certMap := map[string]string{
+			"MTLSRootCA":    filepath.Join(".", "testdata", "ca.pem"),
+			"errorIfNot2XX": "false",
+		}
+		hs, err := InitBindingForHTTPS(server, certMap)
+		require.NoError(t, err)
+		verifyNon2XXErrorsSuppressed(t, hs, handler)
+	})
 }
 
 func TestHTTPSBinding(t *testing.T) {
 	handler := http.NewServeMux()
-	handler.HandleFunc("/testhttps", httpsHandler)
+	handler.HandleFunc("/testmTLS", mTLSHandler)
 	server := setupHTTPSServer(t, true, handler)
 	defer server.Close()
 	t.Run("get with https with valid client cert and clientAuthEnabled true", func(t *testing.T) {
@@ -334,8 +375,8 @@ func TestHTTPSBinding(t *testing.T) {
 		req := TestCase{
 			input:      "GET",
 			operation:  "get",
-			metadata:   map[string]string{"path": "/testhttps"},
-			path:       "/testhttps",
+			metadata:   map[string]string{"path": "/testmTLS"},
+			path:       "/testmTLS",
 			err:        "",
 			statusCode: 200,
 		}.ToInvokeRequest()
@@ -348,8 +389,8 @@ func TestHTTPSBinding(t *testing.T) {
 		req = TestCase{
 			input:      "EXPECTED",
 			operation:  "post",
-			metadata:   map[string]string{"path": "/testhttps"},
-			path:       "/testhttps",
+			metadata:   map[string]string{"path": "/testmTLS"},
+			path:       "/testmTLS",
 			err:        "",
 			statusCode: 201,
 		}.ToInvokeRequest()
@@ -367,13 +408,56 @@ func TestHTTPSBinding(t *testing.T) {
 		req := TestCase{
 			input:      "GET",
 			operation:  "get",
-			metadata:   map[string]string{"path": "/testhttps"},
-			path:       "/testhttps",
+			metadata:   map[string]string{"path": "/testmTLS"},
+			path:       "/testmTLS",
 			err:        "",
 			statusCode: 200,
 		}.ToInvokeRequest()
 		_, err = hs.Invoke(context.Background(), &req)
 		assert.Error(t, err)
+	})
+
+	t.Run("get with https without client cert and clientAuthEnabled false", func(t *testing.T) {
+		server = setupHTTPSServer(t, false, handler)
+		certMap := map[string]string{
+			"MTLSRootCA": filepath.Join(".", "testdata", "ca.pem"),
+		}
+		hs, err := InitBindingForHTTPS(server, certMap)
+		require.NoError(t, err)
+
+		req := TestCase{
+			input:      "GET",
+			operation:  "get",
+			metadata:   map[string]string{"path": "/testmTLS"},
+			path:       "/testmTLS",
+			err:        "",
+			statusCode: 200,
+		}.ToInvokeRequest()
+		response, err := hs.Invoke(context.Background(), &req)
+		assert.NoError(t, err)
+		peerCerts, err := strconv.Atoi(string(response.Data))
+		assert.NoError(t, err)
+		// Checking for 0 peer certs as client auth is disabled.
+		// If client auth is enabled, then the number of peer certs will be > 0.
+		// For HTTP, request will not have TLS info only.
+		assert.True(t, peerCerts == 0)
+
+		req = TestCase{
+			input:      "EXPECTED",
+			operation:  "post",
+			metadata:   map[string]string{"path": "/testmTLS"},
+			path:       "/testmTLS",
+			err:        "",
+			statusCode: 201,
+		}.ToInvokeRequest()
+		response, err = hs.Invoke(context.Background(), &req)
+		assert.NoError(t, err)
+		peerCerts, err = strconv.Atoi(string(response.Data))
+		assert.NoError(t, err)
+		// Checking for 0 peer certs as client auth is disabled.
+		// If client auth is enabled, then the number of peer certs will be > 0.
+		// For HTTP, request will not have TLS info only.
+		assert.True(t, peerCerts == 0)
 	})
 }
 
@@ -477,14 +561,6 @@ func verifyDefaultBehaviors(t *testing.T, hs bindings.OutputBinding, handler *HT
 			path:       "/test",
 			err:        "",
 			statusCode: 200,
-		},
-		"invalid path": {
-			input:      "expected",
-			operation:  "POST",
-			metadata:   map[string]string{"path": "/../test"},
-			path:       "",
-			err:        "invalid path: /../test",
-			statusCode: 400,
 		},
 		"invalid operation": {
 			input:      "notvalid",
@@ -590,14 +666,6 @@ func verifyNon2XXErrorsSuppressed(t *testing.T, hs bindings.OutputBinding, handl
 			err:        "",
 			statusCode: 200,
 		},
-		"invalid path": {
-			input:      "expected",
-			operation:  "POST",
-			metadata:   map[string]string{"path": "/../test"},
-			path:       "",
-			err:        "invalid path: /../test",
-			statusCode: 400,
-		},
 	}
 
 	for name, tc := range tests {
@@ -668,4 +736,28 @@ func verifyTimeoutBehavior(t *testing.T, hs bindings.OutputBinding, handler *HTT
 			}
 		})
 	}
+}
+
+func TestMaxBodySizeHonored(t *testing.T) {
+	handler := NewHTTPHandler()
+	s := httptest.NewServer(handler)
+	defer s.Close()
+
+	hs, err := InitBinding(s, map[string]string{"maxResponseBodySize": "1Ki"})
+	require.NoError(t, err)
+
+	tc := TestCase{
+		input:      "GET",
+		operation:  "get",
+		path:       "/large",
+		err:        "context deadline exceeded",
+		statusCode: 200,
+	}
+
+	req := tc.ToInvokeRequest()
+	response, err := hs.Invoke(context.Background(), &req)
+	require.NoError(t, err)
+
+	// Should have only read 1KB
+	assert.Len(t, response.Data, 1<<10)
 }

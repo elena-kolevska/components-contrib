@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -61,19 +62,21 @@ type AWSS3 struct {
 }
 
 type s3Metadata struct {
-	Region         string `json:"region"`
-	Endpoint       string `json:"endpoint"`
-	AccessKey      string `json:"accessKey"`
-	SecretKey      string `json:"secretKey"`
-	SessionToken   string `json:"sessionToken"`
-	Bucket         string `json:"bucket"`
-	DecodeBase64   bool   `json:"decodeBase64,string"`
-	EncodeBase64   bool   `json:"encodeBase64,string"`
-	ForcePathStyle bool   `json:"forcePathStyle,string"`
-	DisableSSL     bool   `json:"disableSSL,string"`
-	InsecureSSL    bool   `json:"insecureSSL,string"`
-	FilePath       string
-	PresignTTL     string
+	// Ignored by metadata parser because included in built-in authentication profile
+	AccessKey    string `json:"accessKey" mapstructure:"accessKey" mdignore:"true"`
+	SecretKey    string `json:"secretKey" mapstructure:"secretKey" mdignore:"true"`
+	SessionToken string `json:"sessionToken" mapstructure:"sessionToken" mdignore:"true"`
+
+	Region         string `json:"region" mapstructure:"region"`
+	Endpoint       string `json:"endpoint" mapstructure:"endpoint"`
+	Bucket         string `json:"bucket" mapstructure:"bucket"`
+	DecodeBase64   bool   `json:"decodeBase64,string" mapstructure:"decodeBase64"`
+	EncodeBase64   bool   `json:"encodeBase64,string" mapstructure:"encodeBase64"`
+	ForcePathStyle bool   `json:"forcePathStyle,string" mapstructure:"forcePathStyle"`
+	DisableSSL     bool   `json:"disableSSL,string" mapstructure:"disableSSL"`
+	InsecureSSL    bool   `json:"insecureSSL,string" mapstructure:"insecureSSL"`
+	FilePath       string `json:"filePath" mapstructure:"filePath"   mdignore:"true"`
+	PresignTTL     string `json:"presignTTL" mapstructure:"presignTTL"  mdignore:"true"`
 }
 
 type createResponse struct {
@@ -124,6 +127,8 @@ func (s *AWSS3) Init(_ context.Context, metadata bindings.Metadata) error {
 			Transport: customTransport,
 		}
 		cfg = cfg.WithHTTPClient(client)
+
+		s.logger.Infof("aws s3: you are using 'insecureSSL' to skip server config verify which is unsafe!")
 	}
 
 	s.metadata = m
@@ -209,6 +214,9 @@ func (s *AWSS3) create(ctx context.Context, req *bindings.InvokeRequest) (*bindi
 
 	return &bindings.InvokeResponse{
 		Data: jsonResponse,
+		Metadata: map[string]string{
+			metadataKey: key,
+		},
 	}, nil
 }
 
@@ -321,10 +329,11 @@ func (s *AWSS3) delete(ctx context.Context, req *bindings.InvokeRequest) (*bindi
 }
 
 func (s *AWSS3) list(ctx context.Context, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
-	var payload listPayload
-	err := json.Unmarshal(req.Data, &payload)
-	if err != nil {
-		return nil, err
+	payload := listPayload{}
+	if req.Data != nil {
+		if err := json.Unmarshal(req.Data, &payload); err != nil {
+			return nil, fmt.Errorf("s3 binding (List Operation) - unable to parse Data property - %v", err)
+		}
 	}
 
 	if payload.MaxResults < 1 {
@@ -408,4 +417,11 @@ func (metadata s3Metadata) mergeWithRequestMetadata(req *bindings.InvokeRequest)
 	}
 
 	return merged, nil
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (s *AWSS3) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
+	metadataStruct := s3Metadata{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.BindingType)
+	return
 }

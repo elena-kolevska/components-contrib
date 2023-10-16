@@ -16,19 +16,22 @@ package pulsar
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
-	"strconv"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/hamba/avro/v2"
-
 	"github.com/apache/pulsar-client-go/pulsar"
+	"github.com/apache/pulsar-client-go/pulsar/crypto"
+	"github.com/hamba/avro/v2"
 	lru "github.com/hashicorp/golang-lru/v2"
 
+	"github.com/dapr/components-contrib/internal/authentication/oauth2"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/kit/logger"
 )
@@ -49,6 +52,8 @@ const (
 	redeliveryDelay         = "redeliveryDelay"
 	avroProtocol            = "avro"
 	jsonProtocol            = "json"
+	protoProtocol           = "proto"
+	partitionKey            = "partitionKey"
 
 	defaultTenant     = "public"
 	defaultNamespace  = "default"
@@ -57,11 +62,12 @@ const (
 	pulsarToken       = "token"
 	// topicFormat is the format for pulsar, which have a well-defined structure: {persistent|non-persistent}://tenant/namespace/topic,
 	// see https://pulsar.apache.org/docs/en/concepts-messaging/#topics for details.
-	topicFormat               = "%s://%s/%s/%s"
-	persistentStr             = "persistent"
-	nonPersistentStr          = "non-persistent"
-	topicJSONSchemaIdentifier = ".jsonschema"
-	topicAvroSchemaIdentifier = ".avroschema"
+	topicFormat                = "%s://%s/%s/%s"
+	persistentStr              = "persistent"
+	nonPersistentStr           = "non-persistent"
+	topicJSONSchemaIdentifier  = ".jsonschema"
+	topicAvroSchemaIdentifier  = ".avroschema"
+	topicProtoSchemaIdentifier = ".protoschema"
 
 	// defaultBatchingMaxPublishDelay init default for maximum delay to batch messages.
 	defaultBatchingMaxPublishDelay = 10 * time.Millisecond
@@ -71,7 +77,21 @@ const (
 	defaultMaxBatchSize = 128 * 1024
 	// defaultRedeliveryDelay init default for redelivery delay.
 	defaultRedeliveryDelay = 30 * time.Second
+
+	subscribeTypeKey = "subscribeType"
+
+	subscribeTypeExclusive = "exclusive"
+	subscribeTypeShared    = "shared"
+	subscribeTypeFailover  = "failover"
+	subscribeTypeKeyShared = "key_shared"
+
+	processModeKey = "processMode"
+
+	processModeAsync = "async"
+	processModeSync  = "sync"
 )
+
+type ProcessMode string
 
 type Pulsar struct {
 	logger   logger.Logger
@@ -91,90 +111,44 @@ func NewPulsar(l logger.Logger) pubsub.PubSub {
 }
 
 func parsePulsarMetadata(meta pubsub.Metadata) (*pulsarMetadata, error) {
-	m := pulsarMetadata{Persistent: true, Tenant: defaultTenant, Namespace: defaultNamespace, topicSchemas: map[string]schemaMetadata{}}
-	m.ConsumerID = meta.Properties[consumerID]
+	m := pulsarMetadata{
+		Persistent:              true,
+		Tenant:                  defaultTenant,
+		Namespace:               defaultNamespace,
+		internalTopicSchemas:    map[string]schemaMetadata{},
+		DisableBatching:         false,
+		BatchingMaxPublishDelay: defaultBatchingMaxPublishDelay,
+		BatchingMaxMessages:     defaultMaxMessages,
+		BatchingMaxSize:         defaultMaxBatchSize,
+		RedeliveryDelay:         defaultRedeliveryDelay,
+	}
 
-	if val, ok := meta.Properties[host]; ok && val != "" {
-		m.Host = val
-	} else {
+	if err := metadata.DecodeMetadata(meta.Properties, &m); err != nil {
+		return nil, err
+	}
+
+	if m.Host == "" {
 		return nil, errors.New("pulsar error: missing pulsar host")
-	}
-	if val, ok := meta.Properties[enableTLS]; ok && val != "" {
-		tls, err := strconv.ParseBool(val)
-		if err != nil {
-			return nil, errors.New("pulsar error: invalid value for enableTLS")
-		}
-		m.EnableTLS = tls
-	}
-	// DisableBatching is defaultly batching.
-	m.DisableBatching = false
-	if val, ok := meta.Properties[disableBatching]; ok {
-		disableBatching, err := strconv.ParseBool(val)
-		if err != nil {
-			return nil, errors.New("pulsar error: invalid value for disableBatching")
-		}
-		m.DisableBatching = disableBatching
-	}
-	m.BatchingMaxPublishDelay = defaultBatchingMaxPublishDelay
-	if val, ok := meta.Properties[batchingMaxPublishDelay]; ok {
-		batchingMaxPublishDelay, err := formatDuration(val)
-		if err != nil {
-			return nil, errors.New("pulsar error: invalid value for batchingMaxPublishDelay")
-		}
-		m.BatchingMaxPublishDelay = batchingMaxPublishDelay
-	}
-	m.BatchingMaxMessages = defaultMaxMessages
-	if val, ok := meta.Properties[batchingMaxMessages]; ok {
-		batchingMaxMessages, err := strconv.ParseUint(val, 10, 64)
-		if err != nil {
-			return nil, errors.New("pulsar error: invalid value for batchingMaxMessages")
-		}
-		m.BatchingMaxMessages = uint(batchingMaxMessages)
-	}
-	m.BatchingMaxSize = defaultMaxBatchSize
-	if val, ok := meta.Properties[batchingMaxSize]; ok {
-		batchingMaxSize, err := strconv.ParseUint(val, 10, 64)
-		if err != nil {
-			return nil, errors.New("pulsar error: invalid value for batchingMaxSize")
-		}
-		m.BatchingMaxSize = uint(batchingMaxSize)
-	}
-	m.RedeliveryDelay = defaultRedeliveryDelay
-	if val, ok := meta.Properties[redeliveryDelay]; ok {
-		redeliveryDelay, err := formatDuration(val)
-		if err != nil {
-			return nil, errors.New("pulsar error: invalid value for redeliveryDelay")
-		}
-		m.RedeliveryDelay = redeliveryDelay
-	}
-	if val, ok := meta.Properties[persistent]; ok && val != "" {
-		per, err := strconv.ParseBool(val)
-		if err != nil {
-			return nil, errors.New("pulsar error: invalid value for persistent")
-		}
-		m.Persistent = per
-	}
-	if val, ok := meta.Properties[tenant]; ok && val != "" {
-		m.Tenant = val
-	}
-	if val, ok := meta.Properties[namespace]; ok && val != "" {
-		m.Namespace = val
-	}
-	if val, ok := meta.Properties[pulsarToken]; ok && val != "" {
-		m.Token = val
 	}
 
 	for k, v := range meta.Properties {
-		if strings.HasSuffix(k, topicJSONSchemaIdentifier) {
+		switch {
+		case strings.HasSuffix(k, topicJSONSchemaIdentifier):
 			topic := k[:len(k)-len(topicJSONSchemaIdentifier)]
-			m.topicSchemas[topic] = schemaMetadata{
+			m.internalTopicSchemas[topic] = schemaMetadata{
 				protocol: jsonProtocol,
 				value:    v,
 			}
-		} else if strings.HasSuffix(k, topicAvroSchemaIdentifier) {
-			topic := k[:len(k)-len(topicJSONSchemaIdentifier)]
-			m.topicSchemas[topic] = schemaMetadata{
+		case strings.HasSuffix(k, topicAvroSchemaIdentifier):
+			topic := k[:len(k)-len(topicAvroSchemaIdentifier)]
+			m.internalTopicSchemas[topic] = schemaMetadata{
 				protocol: avroProtocol,
+				value:    v,
+			}
+		case strings.HasSuffix(k, topicProtoSchemaIdentifier):
+			topic := k[:len(k)-len(topicProtoSchemaIdentifier)]
+			m.internalTopicSchemas[topic] = schemaMetadata{
+				protocol: protoProtocol,
 				value:    v,
 			}
 		}
@@ -183,7 +157,7 @@ func parsePulsarMetadata(meta pubsub.Metadata) (*pulsarMetadata, error) {
 	return &m, nil
 }
 
-func (p *Pulsar) Init(_ context.Context, metadata pubsub.Metadata) error {
+func (p *Pulsar) Init(ctx context.Context, metadata pubsub.Metadata) error {
 	m, err := parsePulsarMetadata(metadata)
 	if err != nil {
 		return err
@@ -199,9 +173,28 @@ func (p *Pulsar) Init(_ context.Context, metadata pubsub.Metadata) error {
 		ConnectionTimeout:          30 * time.Second,
 		TLSAllowInsecureConnection: !m.EnableTLS,
 	}
-	if m.Token != "" {
+
+	switch {
+	case len(m.Token) > 0:
 		options.Authentication = pulsar.NewAuthenticationToken(m.Token)
+	case len(m.ClientCredentialsMetadata.TokenURL) > 0:
+		var cc *oauth2.ClientCredentials
+		cc, err = oauth2.NewClientCredentials(ctx, oauth2.ClientCredentialsOptions{
+			Logger:       p.logger,
+			TokenURL:     m.ClientCredentialsMetadata.TokenURL,
+			CAPEM:        []byte(m.ClientCredentialsMetadata.TokenCAPEM),
+			ClientID:     m.ClientCredentialsMetadata.ClientID,
+			ClientSecret: m.ClientCredentialsMetadata.ClientSecret,
+			Scopes:       m.ClientCredentialsMetadata.Scopes,
+			Audiences:    m.ClientCredentialsMetadata.Audiences,
+		})
+		if err != nil {
+			return fmt.Errorf("could not instantiate oauth2 token provider: %w", err)
+		}
+
+		options.Authentication = pulsar.NewAuthenticationTokenFromSupplier(cc.Token)
 	}
+
 	client, err := pulsar.NewClient(options)
 	if err != nil {
 		return fmt.Errorf("could not instantiate pulsar client: %v", err)
@@ -226,6 +219,14 @@ func (p *Pulsar) Init(_ context.Context, metadata pubsub.Metadata) error {
 	return nil
 }
 
+func (p *Pulsar) useProducerEncryption() bool {
+	return p.metadata.PublicKey != "" && p.metadata.Keys != ""
+}
+
+func (p *Pulsar) useConsumerEncryption() bool {
+	return p.metadata.PublicKey != "" && p.metadata.PrivateKey != ""
+}
+
 func (p *Pulsar) Publish(ctx context.Context, req *pubsub.PublishRequest) error {
 	if p.closed.Load() {
 		return errors.New("component is closed")
@@ -238,7 +239,7 @@ func (p *Pulsar) Publish(ctx context.Context, req *pubsub.PublishRequest) error 
 	topic := p.formatTopic(req.Topic)
 	producer, ok := p.cache.Get(topic)
 
-	sm, hasSchema := p.metadata.topicSchemas[req.Topic]
+	sm, hasSchema := p.metadata.internalTopicSchemas[req.Topic]
 
 	if !ok || producer == nil {
 		p.logger.Debugf("creating producer for topic %s, full topic name in pulsar is %s", req.Topic, topic)
@@ -254,6 +255,20 @@ func (p *Pulsar) Publish(ctx context.Context, req *pubsub.PublishRequest) error 
 			opts.Schema = getPulsarSchema(sm)
 		}
 
+		if p.useProducerEncryption() {
+			var reader crypto.KeyReader
+			if isValidPEM(p.metadata.PublicKey) {
+				reader = NewDataKeyReader(p.metadata.PublicKey, "")
+			} else {
+				reader = crypto.NewFileKeyReader(p.metadata.PublicKey, "")
+			}
+
+			opts.Encryption = &pulsar.ProducerEncryptionInfo{
+				KeyReader: reader,
+				Keys:      strings.Split(p.metadata.Keys, ","),
+			}
+		}
+
 		producer, err = p.client.CreateProducer(opts)
 		if err != nil {
 			return err
@@ -266,6 +281,7 @@ func (p *Pulsar) Publish(ctx context.Context, req *pubsub.PublishRequest) error 
 	if err != nil {
 		return err
 	}
+
 	if _, err = producer.Send(ctx, msg); err != nil {
 		return err
 	}
@@ -279,6 +295,8 @@ func getPulsarSchema(metadata schemaMetadata) pulsar.Schema {
 		return pulsar.NewJSONSchema(metadata.value, nil)
 	case avroProtocol:
 		return pulsar.NewAvroSchema(metadata.value, nil)
+	case protoProtocol:
+		return pulsar.NewProtoSchema(metadata.value, nil)
 	default:
 		return nil
 	}
@@ -318,20 +336,54 @@ func parsePublishMetadata(req *pubsub.PublishRequest, schema schemaMetadata) (
 		msg.Value = obj
 	}
 
-	if val, ok := req.Metadata[deliverAt]; ok {
-		msg.DeliverAt, err = time.Parse(time.RFC3339, val)
-		if err != nil {
-			return nil, err
+	for name, value := range req.Metadata {
+		if value == "" {
+			continue
 		}
-	}
-	if val, ok := req.Metadata[deliverAfter]; ok {
-		msg.DeliverAfter, err = time.ParseDuration(val)
-		if err != nil {
-			return nil, err
+
+		switch name {
+		case partitionKey:
+			msg.Key = value
+		case deliverAt:
+			msg.DeliverAt, err = time.Parse(time.RFC3339, value)
+			if err != nil {
+				return nil, err
+			}
+		case deliverAfter:
+			msg.DeliverAfter, err = time.ParseDuration(value)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			if msg.Properties == nil {
+				msg.Properties = make(map[string]string)
+			}
+			msg.Properties[name] = value
 		}
 	}
 
 	return msg, nil
+}
+
+// default: shared
+func getSubscribeType(metadata map[string]string) pulsar.SubscriptionType {
+	var subsType pulsar.SubscriptionType
+
+	subsTypeStr := strings.ToLower(metadata[subscribeTypeKey])
+	switch subsTypeStr {
+	case subscribeTypeExclusive:
+		subsType = pulsar.Exclusive
+	case subscribeTypeFailover:
+		subsType = pulsar.Failover
+	case subscribeTypeShared:
+		subsType = pulsar.Shared
+	case subscribeTypeKeyShared:
+		subsType = pulsar.KeyShared
+	default:
+		subsType = pulsar.Shared
+	}
+
+	return subsType
 }
 
 func (p *Pulsar) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, handler pubsub.Handler) error {
@@ -346,12 +398,25 @@ func (p *Pulsar) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, han
 	options := pulsar.ConsumerOptions{
 		Topic:               topic,
 		SubscriptionName:    p.metadata.ConsumerID,
-		Type:                pulsar.Shared,
+		Type:                getSubscribeType(req.Metadata),
 		MessageChannel:      channel,
 		NackRedeliveryDelay: p.metadata.RedeliveryDelay,
 	}
 
-	if sm, ok := p.metadata.topicSchemas[req.Topic]; ok {
+	if p.useConsumerEncryption() {
+		var reader crypto.KeyReader
+		if isValidPEM(p.metadata.PublicKey) {
+			reader = NewDataKeyReader(p.metadata.PublicKey, p.metadata.PrivateKey)
+		} else {
+			reader = crypto.NewFileKeyReader(p.metadata.PublicKey, p.metadata.PrivateKey)
+		}
+
+		options.Decryption = &pulsar.MessageDecryptionInfo{
+			KeyReader: reader,
+		}
+	}
+
+	if sm, ok := p.metadata.internalTopicSchemas[req.Topic]; ok {
 		options.Schema = getPulsarSchema(sm)
 	}
 	consumer, err := p.client.Subscribe(options)
@@ -373,28 +438,36 @@ func (p *Pulsar) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, han
 	go func() {
 		defer p.wg.Done()
 		defer cancel()
-		p.listenMessage(listenCtx, req.Topic, consumer, handler)
+		p.listenMessage(listenCtx, req, consumer, handler)
 	}()
 
 	return nil
 }
 
-func (p *Pulsar) listenMessage(ctx context.Context, originTopic string, consumer pulsar.Consumer, handler pubsub.Handler) {
+func (p *Pulsar) listenMessage(ctx context.Context, req pubsub.SubscribeRequest, consumer pulsar.Consumer, handler pubsub.Handler) {
 	defer consumer.Close()
 
+	originTopic := req.Topic
 	var err error
 	for {
 		select {
 		case msg := <-consumer.Chan():
-			// Go routine to handle multiple messages at once.
-			p.wg.Add(1)
-			go func(msg pulsar.ConsumerMessage) {
-				defer p.wg.Done()
+			if strings.ToLower(req.Metadata[processModeKey]) == processModeSync { //nolint:gocritic
 				err = p.handleMessage(ctx, originTopic, msg, handler)
 				if err != nil && !errors.Is(err, context.Canceled) {
-					p.logger.Errorf("Error processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
+					p.logger.Errorf("Error sync processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
 				}
-			}(msg)
+			} else { // async process mode by default
+				// Go routine to handle multiple messages at once.
+				p.wg.Add(1)
+				go func(msg pulsar.ConsumerMessage) {
+					defer p.wg.Done()
+					err = p.handleMessage(ctx, originTopic, msg, handler)
+					if err != nil && !errors.Is(err, context.Canceled) {
+						p.logger.Errorf("Error async processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
+					}
+				}(msg)
+			}
 
 		case <-ctx.Done():
 			p.logger.Errorf("Subscription context done. Closing consumer. Err: %s", ctx.Err())
@@ -452,13 +525,15 @@ func (p *Pulsar) formatTopic(topic string) string {
 	return fmt.Sprintf(topicFormat, persist, p.metadata.Tenant, p.metadata.Namespace, topic)
 }
 
-func formatDuration(durationString string) (time.Duration, error) {
-	if val, err := strconv.Atoi(durationString); err == nil {
-		return time.Duration(val) * time.Millisecond, nil
-	}
+// GetComponentMetadata returns the metadata of the component.
+func (p *Pulsar) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
+	metadataStruct := pulsarMetadata{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.PubSubType)
+	return
+}
 
-	// Convert it by parsing
-	d, err := time.ParseDuration(durationString)
-
-	return d, err
+// isValidPEM validates the provided input has PEM formatted block.
+func isValidPEM(val string) bool {
+	block, _ := pem.Decode([]byte(val))
+	return block != nil
 }

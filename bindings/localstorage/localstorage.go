@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -39,6 +40,9 @@ const (
 
 // List of root paths that are disallowed
 var disallowedRootPaths = []string{
+	filepath.Clean("/proc"),
+	filepath.Clean("/sys"),
+	filepath.Clean("/boot"),
 	// See: https://github.com/dapr/components-contrib/issues/2444
 	filepath.Clean("/var/run/secrets"),
 }
@@ -329,4 +333,11 @@ func (ls *LocalStorage) Invoke(_ context.Context, req *bindings.InvokeRequest) (
 	default:
 		return nil, fmt.Errorf("unsupported operation %s", req.Operation)
 	}
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (ls *LocalStorage) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
+	metadataStruct := Metadata{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.BindingType)
+	return
 }

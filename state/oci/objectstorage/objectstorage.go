@@ -56,7 +56,7 @@ const (
 )
 
 type StateStore struct {
-	state.DefaultBulkStore
+	state.BulkStore
 
 	json     jsoniter.API
 	features []state.Feature
@@ -168,12 +168,15 @@ func (r *StateStore) Ping(ctx context.Context) error {
 
 func NewOCIObjectStorageStore(logger logger.Logger) state.Store {
 	s := &StateStore{
-		json:     jsoniter.ConfigFastest,
-		features: []state.Feature{state.FeatureETag},
-		logger:   logger,
-		client:   nil,
+		json: jsoniter.ConfigFastest,
+		features: []state.Feature{
+			state.FeatureETag,
+			state.FeatureTTL,
+		},
+		logger: logger,
+		client: nil,
 	}
-	s.DefaultBulkStore = state.NewDefaultBulkStore(s)
+	s.BulkStore = state.NewDefaultBulkStore(s)
 
 	return s
 }
@@ -517,9 +520,8 @@ func (c *ociObjectStorageClient) pingBucket(ctx context.Context) error {
 	return nil
 }
 
-func (r *StateStore) GetComponentMetadata() map[string]string {
+func (r *StateStore) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
 	metadataStruct := objectStoreMetadata{}
-	metadataInfo := map[string]string{}
-	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
-	return metadataInfo
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.StateStoreType)
+	return
 }

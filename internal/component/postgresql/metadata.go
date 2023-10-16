@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Dapr Authors
+Copyright 2023 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -15,9 +15,9 @@ package postgresql
 
 import (
 	"fmt"
-	"strconv"
 	"time"
 
+	pgauth "github.com/dapr/components-contrib/internal/authentication/postgresql"
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/ptr"
@@ -33,23 +33,22 @@ const (
 	defaultTimeout           = 20   // Default timeout for network requests, in seconds
 )
 
-type postgresMetadataStruct struct {
-	ConnectionString      string
-	ConnectionMaxIdleTime time.Duration
-	TableName             string // Could be in the format "schema.table" or just "table"
-	MetadataTableName     string // Could be in the format "schema.table" or just "table"
+type pgMetadata struct {
+	pgauth.PostgresAuthMetadata `mapstructure:",squash"`
 
-	timeout         time.Duration
-	cleanupInterval *time.Duration
+	TableName         string         `mapstructure:"tableName"`         // Could be in the format "schema.table" or just "table"
+	MetadataTableName string         `mapstructure:"metadataTableName"` // Could be in the format "schema.table" or just "table"
+	Timeout           time.Duration  `mapstructure:"timeoutInSeconds"`
+	CleanupInterval   *time.Duration `mapstructure:"cleanupIntervalInSeconds"`
 }
 
-func (m *postgresMetadataStruct) InitWithMetadata(meta state.Metadata) error {
+func (m *pgMetadata) InitWithMetadata(meta state.Metadata, azureADEnabled bool) error {
 	// Reset the object
-	m.ConnectionString = ""
+	m.PostgresAuthMetadata.Reset()
 	m.TableName = defaultTableName
 	m.MetadataTableName = defaultMetadataTableName
-	m.cleanupInterval = ptr.Of(defaultCleanupInternal * time.Second)
-	m.timeout = defaultTimeout * time.Second
+	m.CleanupInterval = ptr.Of(defaultCleanupInternal * time.Second)
+	m.Timeout = defaultTimeout * time.Second
 
 	// Decode the metadata
 	err := metadata.DecodeMetadata(meta.Properties, &m)
@@ -58,37 +57,24 @@ func (m *postgresMetadataStruct) InitWithMetadata(meta state.Metadata) error {
 	}
 
 	// Validate and sanitize input
-	if m.ConnectionString == "" {
-		return errMissingConnectionString
+	err = m.PostgresAuthMetadata.InitWithMetadata(meta.Properties, azureADEnabled)
+	if err != nil {
+		return err
 	}
 
 	// Timeout
-	s, ok := meta.Properties[timeoutKey]
-	if ok && s != "" {
-		timeoutInSec, err := strconv.ParseInt(s, 10, 0)
-		if err != nil {
-			return fmt.Errorf("invalid value for '%s': %s", timeoutKey, s)
-		}
-		if timeoutInSec < 1 {
-			return fmt.Errorf("invalid value for '%s': must be greater than 0", timeoutKey)
-		}
-
-		m.timeout = time.Duration(timeoutInSec) * time.Second
+	if m.Timeout < 1*time.Second {
+		return fmt.Errorf("invalid value for '%s': must be greater than 0", timeoutKey)
 	}
 
 	// Cleanup interval
-	s, ok = meta.Properties[cleanupIntervalKey]
-	if ok && s != "" {
-		cleanupIntervalInSec, err := strconv.ParseInt(s, 10, 0)
-		if err != nil {
-			return fmt.Errorf("invalid value for '%s': %s", cleanupIntervalKey, s)
-		}
-
-		// Non-positive value from meta means disable auto cleanup.
-		if cleanupIntervalInSec > 0 {
-			m.cleanupInterval = ptr.Of(time.Duration(cleanupIntervalInSec) * time.Second)
+	// Non-positive value from meta means disable auto cleanup.
+	if m.CleanupInterval != nil && *m.CleanupInterval <= 0 {
+		if meta.Properties[cleanupIntervalKey] == "" {
+			// Unfortunately the mapstructure decoder decodes an empty string to 0, a missing key would be nil however
+			m.CleanupInterval = ptr.Of(defaultCleanupInternal * time.Second)
 		} else {
-			m.cleanupInterval = nil
+			m.CleanupInterval = nil
 		}
 	}
 

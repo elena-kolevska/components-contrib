@@ -15,9 +15,11 @@ package cassandra
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
+	"time"
 
 	"github.com/gocql/gocql"
 	jsoniter "github.com/json-iterator/go"
@@ -49,7 +51,8 @@ const (
 
 // Cassandra is a state store implementation for Apache Cassandra.
 type Cassandra struct {
-	state.DefaultBulkStore
+	state.BulkStore
+
 	session *gocql.Session
 	cluster *gocql.ClusterConfig
 	table   string
@@ -71,9 +74,10 @@ type cassandraMetadata struct {
 
 // NewCassandraStateStore returns a new cassandra state store.
 func NewCassandraStateStore(logger logger.Logger) state.Store {
-	s := &Cassandra{logger: logger}
-	s.DefaultBulkStore = state.NewDefaultBulkStore(s)
-
+	s := &Cassandra{
+		logger: logger,
+	}
+	s.BulkStore = state.NewDefaultBulkStore(s)
 	return s
 }
 
@@ -86,34 +90,36 @@ func (c *Cassandra) Init(_ context.Context, metadata state.Metadata) error {
 
 	cluster, err := c.createClusterConfig(meta)
 	if err != nil {
-		return fmt.Errorf("error creating cluster config: %s", err)
+		return fmt.Errorf("error creating cluster config: %w", err)
 	}
 	c.cluster = cluster
 
 	session, err := cluster.CreateSession()
 	if err != nil {
-		return fmt.Errorf("error creating session: %s", err)
+		return fmt.Errorf("error creating session: %w", err)
 	}
 	c.session = session
 
 	err = c.tryCreateKeyspace(meta.Keyspace, meta.ReplicationFactor)
 	if err != nil {
-		return fmt.Errorf("error creating keyspace %s: %s", meta.Keyspace, err)
+		return fmt.Errorf("error creating keyspace %s: %w", meta.Keyspace, err)
 	}
 
 	err = c.tryCreateTable(meta.Table, meta.Keyspace)
 	if err != nil {
-		return fmt.Errorf("error creating table %s: %s", meta.Table, err)
+		return fmt.Errorf("error creating table %s: %w", meta.Table, err)
 	}
 
-	c.table = fmt.Sprintf("%s.%s", meta.Keyspace, meta.Table)
+	c.table = meta.Keyspace + "." + meta.Table
 
 	return nil
 }
 
 // Features returns the features available in this state store.
 func (c *Cassandra) Features() []state.Feature {
-	return nil
+	return []state.Feature{
+		state.FeatureTTL,
+	}
 }
 
 func (c *Cassandra) tryCreateKeyspace(keyspace string, replicationFactor int) error {
@@ -238,7 +244,8 @@ func (c *Cassandra) Get(ctx context.Context, req *state.GetRequest) (*state.GetR
 		session = sess
 	}
 
-	results, err := session.Query(fmt.Sprintf("SELECT value FROM %s WHERE key = ?", c.table), req.Key).WithContext(ctx).Iter().SliceMap()
+	const selectQuery = "SELECT value, TTL(value) AS ttl, toTimestamp(now()) AS now FROM %s WHERE key = ?"
+	results, err := session.Query(fmt.Sprintf(selectQuery, c.table), req.Key).WithContext(ctx).Iter().SliceMap()
 	if err != nil {
 		return nil, err
 	}
@@ -247,8 +254,20 @@ func (c *Cassandra) Get(ctx context.Context, req *state.GetRequest) (*state.GetR
 		return &state.GetResponse{}, nil
 	}
 
+	var metadata map[string]string
+	if ttl := results[0]["ttl"].(int); ttl > 0 {
+		now, ok := results[0]["now"].(time.Time)
+		if !ok {
+			return nil, errors.New("failed to parse cassandra timestamp")
+		}
+		metadata = map[string]string{
+			state.GetRespMetaKeyTTLExpireTime: now.Add(time.Duration(ttl) * time.Second).UTC().Format(time.RFC3339),
+		}
+	}
+
 	return &state.GetResponse{
-		Data: results[0]["value"].([]byte),
+		Data:     results[0]["value"].([]byte),
+		Metadata: metadata,
 	}, nil
 }
 
@@ -303,9 +322,19 @@ func (c *Cassandra) createSession(consistency gocql.Consistency) (*gocql.Session
 	return session, nil
 }
 
-func (c *Cassandra) GetComponentMetadata() map[string]string {
+func (c *Cassandra) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
 	metadataStruct := cassandraMetadata{}
-	metadataInfo := map[string]string{}
-	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
-	return metadataInfo
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.StateStoreType)
+	return
+}
+
+// Close the connection to Cassandra.
+func (c *Cassandra) Close() error {
+	if c.session == nil {
+		return nil
+	}
+
+	c.session.Close()
+
+	return nil
 }

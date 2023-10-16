@@ -19,10 +19,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 )
 
-func updatePasswordAuthInfo(config *sarama.Config, metadata *kafkaMetadata, saslUsername, saslPassword string) {
+func updatePasswordAuthInfo(config *sarama.Config, metadata *KafkaMetadata, saslUsername, saslPassword string) {
 	config.Net.SASL.Enable = true
 	config.Net.SASL.User = saslUsername
 	config.Net.SASL.Password = saslPassword
@@ -37,7 +37,7 @@ func updatePasswordAuthInfo(config *sarama.Config, metadata *kafkaMetadata, sasl
 	}
 }
 
-func updateMTLSAuthInfo(config *sarama.Config, metadata *kafkaMetadata) error {
+func updateMTLSAuthInfo(config *sarama.Config, metadata *KafkaMetadata) error {
 	if metadata.TLSDisable {
 		return fmt.Errorf("kafka: cannot configure mTLS authentication when TLSDisable is 'true'")
 	}
@@ -49,7 +49,7 @@ func updateMTLSAuthInfo(config *sarama.Config, metadata *kafkaMetadata) error {
 	return nil
 }
 
-func updateTLSConfig(config *sarama.Config, metadata *kafkaMetadata) error {
+func updateTLSConfig(config *sarama.Config, metadata *KafkaMetadata) error {
 	if metadata.TLSDisable || metadata.AuthType == noAuthType {
 		config.Net.TLS.Enable = false
 		return nil
@@ -72,8 +72,8 @@ func updateTLSConfig(config *sarama.Config, metadata *kafkaMetadata) error {
 	return nil
 }
 
-func updateOidcAuthInfo(config *sarama.Config, metadata *kafkaMetadata) error {
-	tokenProvider := newOAuthTokenSource(metadata.OidcTokenEndpoint, metadata.OidcClientID, metadata.OidcClientSecret, metadata.OidcScopes)
+func updateOidcAuthInfo(config *sarama.Config, metadata *KafkaMetadata) error {
+	tokenProvider := metadata.getOAuthTokenSource()
 
 	if metadata.TLSCaCert != "" {
 		err := tokenProvider.addCa(metadata.TLSCaCert)
@@ -82,11 +82,9 @@ func updateOidcAuthInfo(config *sarama.Config, metadata *kafkaMetadata) error {
 		}
 	}
 
-	tokenProvider.skipCaVerify = metadata.TLSSkipVerify
-
 	config.Net.SASL.Enable = true
 	config.Net.SASL.Mechanism = sarama.SASLTypeOAuth
-	config.Net.SASL.TokenProvider = &tokenProvider
+	config.Net.SASL.TokenProvider = tokenProvider
 
 	return nil
 }

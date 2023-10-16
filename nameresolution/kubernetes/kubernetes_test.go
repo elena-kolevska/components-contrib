@@ -26,11 +26,11 @@ func TestResolve(t *testing.T) {
 	resolver := NewResolver(logger.NewLogger("test"))
 	request := nameresolution.ResolveRequest{ID: "myid", Namespace: "abc", Port: 1234}
 
-	u := "myid-dapr.abc.svc.cluster.local:1234"
+	const expect = "myid-dapr.abc.svc.cluster.local:1234"
 	target, err := resolver.ResolveID(request)
 
-	assert.Nil(t, err)
-	assert.Equal(t, target, u)
+	assert.NoError(t, err)
+	assert.Equal(t, expect, target)
 }
 
 func TestResolveWithCustomClusterDomain(t *testing.T) {
@@ -42,9 +42,48 @@ func TestResolveWithCustomClusterDomain(t *testing.T) {
 	})
 	request := nameresolution.ResolveRequest{ID: "myid", Namespace: "abc", Port: 1234}
 
-	u := "myid-dapr.abc.svc.mydomain.com:1234"
+	const expect = "myid-dapr.abc.svc.mydomain.com:1234"
 	target, err := resolver.ResolveID(request)
 
-	assert.Nil(t, err)
-	assert.Equal(t, target, u)
+	assert.NoError(t, err)
+	assert.Equal(t, expect, target)
+}
+
+func TestResolveWithTemplate(t *testing.T) {
+	resolver := NewResolver(logger.NewLogger("test"))
+	_ = resolver.Init(nameresolution.Metadata{
+		Configuration: map[string]interface{}{
+			"template": "{{.ID}}-{{.Namespace}}.internal:{{.Port}}",
+		},
+	})
+
+	request := nameresolution.ResolveRequest{ID: "myid", Namespace: "abc", Port: 1234}
+	const expected = "myid-abc.internal:1234"
+	target, err := resolver.ResolveID(request)
+
+	assert.NoError(t, err)
+	assert.Equal(t, target, expected)
+}
+
+func TestResolveWithTemplateAndData(t *testing.T) {
+	resolver := NewResolver(logger.NewLogger("test"))
+	_ = resolver.Init(nameresolution.Metadata{
+		Configuration: map[string]interface{}{
+			"template": "{{.ID}}-{{.Data.region}}.internal:{{.Port}}",
+		},
+	})
+
+	request := nameresolution.ResolveRequest{
+		ID:        "myid",
+		Namespace: "abc",
+		Port:      1234,
+		Data: map[string]string{
+			"region": "myland",
+		},
+	}
+	const expected = "myid-myland.internal:1234"
+	target, err := resolver.ResolveID(request)
+
+	assert.NoError(t, err)
+	assert.Equal(t, target, expected)
 }

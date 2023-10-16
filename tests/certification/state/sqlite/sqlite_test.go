@@ -613,9 +613,13 @@ func TestSQLite(t *testing.T) {
 
 				ctx := context.Background()
 
+				// We have as many counters as we have number of parallel workers. The final value will be one of them.
+				// This is because we have a race condition between the time we call `save := counter.Add(1)` and when we set the value, causing tests to be flaky since the value stored in the database may not be the one stored in counter.
+				// This is not a bug in the SQLite component, as it's working as intended; the race condition is on the tests themselves.
+				// The real solution to the race condition (and what one should do in a real-world app) would be to wrap the call to increment counter and the store operation in a mutex. However, that would make it so only one query is hitting the database at the same time, while here we're precisely testing how the component handles multiple writes at the same time.
 				wg := sync.WaitGroup{}
 				wg.Add(parallel)
-				counter := atomic.Int32{}
+				counters := [parallel]atomic.Int32{}
 				key := "same"
 				for i := 0; i < parallel; i++ {
 					go func(i int) {
@@ -626,7 +630,7 @@ func TestSQLite(t *testing.T) {
 						storeObj := storeObjs[i%len(storeObjs)]
 
 						for j := 0; j < runs; j++ {
-							save := counter.Add(1)
+							save := counters[i].Add(1)
 							// Save state
 							err = storeObj.Set(ctx, &state.SetRequest{
 								Key:   key,
@@ -644,7 +648,12 @@ func TestSQLite(t *testing.T) {
 					Key: key,
 				})
 				assert.NoError(t, err)
-				assert.Equal(t, strconv.Itoa(int(counter.Load())), string(res.Data))
+
+				expect := [parallel]string{}
+				for i := 0; i < parallel; i++ {
+					expect[i] = strconv.Itoa(int(counters[i].Load()))
+				}
+				assert.Contains(t, expect, string(res.Data))
 			}
 
 			// Init one store object
@@ -675,25 +684,26 @@ func TestSQLite(t *testing.T) {
 		// Start the sidecar with the in-memory database
 		Step(sidecar.Run("sqlite-memory",
 			embedded.WithoutApp(),
-			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
-			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
-			embedded.WithProfilePort(runtime.DefaultProfilePort),
-			embedded.WithComponentsPath("resources/memory"),
-			runtime.WithStates(stateRegistry),
+			embedded.WithDaprGRPCPort(strconv.Itoa(runtime.DefaultDaprAPIGRPCPort)),
+			embedded.WithDaprHTTPPort(strconv.Itoa(runtime.DefaultDaprHTTPPort)),
+			embedded.WithProfilingEnabled(false),
+			embedded.WithResourcesPath("resources/memory"),
+			embedded.WithStates(stateRegistry),
 		)).
 
 		// Run some basic certification tests with the in-memory database
 		Step("run basic test", basicTest(runtime.DefaultDaprAPIGRPCPort)).
 		Step("run SQL injection test", verifySQLInjectionTest(runtime.DefaultDaprAPIGRPCPort)).
+		Step("stop app", sidecar.Stop("sqlite-memory")).
 
 		// Start the sidecar with a read-only database
 		Step(sidecar.Run("sqlite-readonly",
 			embedded.WithoutApp(),
-			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
-			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
-			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
-			embedded.WithComponentsPath("resources/readonly"),
-			runtime.WithStates(stateRegistry),
+			embedded.WithDaprGRPCPort(strconv.Itoa(runtime.DefaultDaprAPIGRPCPort+portOffset)),
+			embedded.WithDaprHTTPPort(strconv.Itoa(runtime.DefaultDaprHTTPPort+portOffset)),
+			embedded.WithProfilingEnabled(false),
+			embedded.WithResourcesPath("resources/readonly"),
+			embedded.WithStates(stateRegistry),
 		)).
 		Step("run read-only test", readonlyTest(runtime.DefaultDaprAPIGRPCPort+portOffset)).
 		Step("stop sqlite-readonly sidecar", sidecar.Stop("sqlite-readonly")).

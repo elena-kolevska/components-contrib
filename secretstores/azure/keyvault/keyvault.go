@@ -22,7 +22,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azsecrets"
+	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
 
 	azauth "github.com/dapr/components-contrib/internal/authentication/azure"
 	"github.com/dapr/components-contrib/metadata"
@@ -146,7 +146,7 @@ func (k *keyvaultSecretStore) BulkGetSecret(ctx context.Context, req secretstore
 
 	secretIDPrefix := k.getVaultURI() + secretItemIDPrefix
 
-	pager := k.vaultClient.NewListSecretsPager(nil)
+	pager := k.vaultClient.NewListSecretPropertiesPager(nil)
 
 out:
 	for pager.More() {
@@ -206,9 +206,8 @@ func (k *keyvaultSecretStore) Features() []secretstores.Feature {
 	return []secretstores.Feature{} // No Feature supported.
 }
 
-func (k *keyvaultSecretStore) GetComponentMetadata() map[string]string {
+func (k *keyvaultSecretStore) GetComponentMetadata() (metadataInfo metadata.MetadataMap) {
 	metadataStruct := KeyvaultMetadata{}
-	metadataInfo := map[string]string{}
-	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
-	return metadataInfo
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.SecretStoreType)
+	return
 }

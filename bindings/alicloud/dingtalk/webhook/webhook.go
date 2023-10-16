@@ -25,11 +25,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/dapr/components-contrib/bindings"
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -202,6 +204,13 @@ func (t *DingTalkWebhook) sendMessage(ctx context.Context, req *bindings.InvokeR
 	}
 
 	return nil
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (t *DingTalkWebhook) GetComponentMetadata() (metadataInfo contribMetadata.MetadataMap) {
+	metadataStruct := Settings{}
+	contribMetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, contribMetadata.BindingType)
+	return
 }
 
 func getPostURL(urlPath, secret string) (string, error) {

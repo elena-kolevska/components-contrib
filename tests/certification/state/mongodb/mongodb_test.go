@@ -3,6 +3,7 @@ package mongodb_test
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -19,7 +20,6 @@ import (
 	"github.com/dapr/components-contrib/tests/certification/flow/network"
 	"github.com/dapr/components-contrib/tests/certification/flow/sidecar"
 	stateLoader "github.com/dapr/dapr/pkg/components/state"
-	"github.com/dapr/dapr/pkg/runtime"
 	daprTesting "github.com/dapr/dapr/pkg/testing"
 	"github.com/dapr/kit/logger"
 	"github.com/stretchr/testify/assert"
@@ -50,7 +50,7 @@ func TestMongoDB(t *testing.T) {
 	currentHTTPPort := ports[1]
 
 	basicTest := func(ctx flow.Context) error {
-		client, err := client.NewClientWithPort(fmt.Sprint(currentGrpcPort))
+		client, err := client.NewClientWithPort(strconv.Itoa(currentGrpcPort))
 		if err != nil {
 			panic(err)
 		}
@@ -66,6 +66,7 @@ func TestMongoDB(t *testing.T) {
 		item, err := client.GetState(ctx, stateStoreName, certificationTestPrefix+"key1", nil)
 		assert.NoError(t, err)
 		assert.Equal(t, "mongodbCert", string(item.Value))
+		assert.NotContains(t, item.Metadata, "ttlExpireTime")
 
 		errUpdate := client.SaveState(ctx, stateStoreName, certificationTestPrefix+"key1", []byte("mongodbCertUpdate"), nil)
 		assert.NoError(t, errUpdate)
@@ -124,6 +125,10 @@ func TestMongoDB(t *testing.T) {
 			item, err := client.GetState(ctx, stateStoreName, certificationTestPrefix+"ttl3", nil)
 			assert.NoError(t, err)
 			assert.Equal(t, "mongodbCert3", string(item.Value))
+			assert.Contains(t, item.Metadata, "ttlExpireTime")
+			expireTime, err := time.Parse(time.RFC3339, item.Metadata["ttlExpireTime"])
+			_ = assert.NoError(t, err) && assert.InDelta(t, time.Now().Add(time.Second*3).Unix(), expireTime.Unix(), 2)
+
 			assert.Eventually(t, func() bool {
 				item, err = client.GetState(ctx, stateStoreName, certificationTestPrefix+"ttl3", nil)
 				require.NoError(t, err)
@@ -147,10 +152,10 @@ func TestMongoDB(t *testing.T) {
 		Step("Waiting for component to start...", flow.Sleep(20*time.Second)).
 		Step(sidecar.Run(sidecarNamePrefix+"dockerClusterDefault",
 			embedded.WithoutApp(),
-			embedded.WithDaprGRPCPort(currentGrpcPort),
-			embedded.WithDaprHTTPPort(currentHTTPPort),
+			embedded.WithDaprGRPCPort(strconv.Itoa(currentGrpcPort)),
+			embedded.WithDaprHTTPPort(strconv.Itoa(currentHTTPPort)),
 			embedded.WithComponentsPath("components/docker/default"),
-			runtime.WithStates(stateRegistry))).
+			embedded.WithStates(stateRegistry))).
 		Step("Waiting for component to load...", flow.Sleep(10*time.Second)).
 		Step("Run basic test", basicTest).
 		Step("Run time to live test", timeToLiveTest(sidecarNamePrefix+"dockerClusterDefault")).
@@ -165,16 +170,15 @@ func TestMongoDB(t *testing.T) {
 		Step("Get Values Saved Earlier And Not Expired, after MongoDB restart", testGetAfterMongoDBRestart).
 		Run()
 
-	flow.New(t, "Connecting MongoDB And Verifying majority of the tests for a replica set "+
-		"here with valid read, write concerns and operation timeout").
+	flow.New(t, "Connecting MongoDB And Verifying majority of the tests for a replica set here with valid read, write concerns and operation timeout").
 		Step(dockercompose.Run("mongodb", dockerComposeClusterYAML)).
 		Step("Waiting for component to start...", flow.Sleep(20*time.Second)).
 		Step(sidecar.Run(sidecarNamePrefix+"dockerClusterValidReadWriteConcernAndTimeout",
 			embedded.WithoutApp(),
-			embedded.WithDaprGRPCPort(currentGrpcPort),
-			embedded.WithDaprHTTPPort(currentHTTPPort),
+			embedded.WithDaprGRPCPort(strconv.Itoa(currentGrpcPort)),
+			embedded.WithDaprHTTPPort(strconv.Itoa(currentHTTPPort)),
 			embedded.WithComponentsPath("components/docker/validReadWriteConcernAndTimeout"),
-			runtime.WithStates(stateRegistry))).
+			embedded.WithStates(stateRegistry))).
 		Step("Waiting for component to load...", flow.Sleep(10*time.Second)).
 		Step("Run basic test", basicTest).
 		Step("Run time to live test", timeToLiveTest(sidecarNamePrefix+"dockerClusterValidReadWriteConcernAndTimeout")).
@@ -189,16 +193,15 @@ func TestMongoDB(t *testing.T) {
 		Step("Get Values Saved Earlier And Not Expired, after MongoDB restart", testGetAfterMongoDBRestart).
 		Run()
 
-	flow.New(t, "Connecting MongoDB And Verifying majority of the tests here for a single node with valid read, "+
-		"write concerns and operation timeout").
+	flow.New(t, "Connecting MongoDB using connectionString and Verifying majority of the tests here for a single node with valid read, write concerns and operation timeout").
 		Step(dockercompose.Run("mongodb", dockerComposeSingleYAML)).
 		Step("Waiting for component to start...", flow.Sleep(20*time.Second)).
 		Step(sidecar.Run(sidecarNamePrefix+"dockerSingleNode",
 			embedded.WithoutApp(),
-			embedded.WithDaprGRPCPort(currentGrpcPort),
-			embedded.WithDaprHTTPPort(currentHTTPPort),
+			embedded.WithDaprGRPCPort(strconv.Itoa(currentGrpcPort)),
+			embedded.WithDaprHTTPPort(strconv.Itoa(currentHTTPPort)),
 			embedded.WithComponentsPath("components/docker/singleNode"),
-			runtime.WithStates(stateRegistry))).
+			embedded.WithStates(stateRegistry))).
 		Step("Waiting for component to load...", flow.Sleep(10*time.Second)).
 		Step("Run basic test", basicTest).
 		Step("Run time to live test", timeToLiveTest(sidecarNamePrefix+"dockerSingleNode")).

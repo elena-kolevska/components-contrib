@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 
 	amqp "github.com/Azure/go-amqp"
 
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/kit/logger"
 )
@@ -127,7 +129,7 @@ func (a *amqpPubSub) Publish(ctx context.Context, req *pubsub.PublishRequest) er
 	if err != nil {
 		a.logger.Errorf("Unable to create link to %s", req.Topic, err)
 	} else {
-		err = sender.Send(ctx, m)
+		err = sender.Send(ctx, m, nil)
 
 		// If the publish operation has failed, attempt to republish a maximum number of times
 		// before giving up
@@ -136,7 +138,7 @@ func (a *amqpPubSub) Publish(ctx context.Context, req *pubsub.PublishRequest) er
 				a.publishRetryCount++
 
 				// Send message
-				err = sender.Send(ctx, m)
+				err = sender.Send(ctx, m, nil)
 
 				if err != nil {
 					a.logger.Warnf("Failed to publish a message to the broker", err)
@@ -194,7 +196,7 @@ func (a *amqpPubSub) subscribeForever(ctx context.Context, receiver *amqp.Receiv
 	defer a.logger.Infof("closing receiver for %s", t)
 	for ctx.Err() == nil {
 		// Receive next message
-		msg, err := receiver.Receive(ctx)
+		msg, err := receiver.Receive(ctx, nil)
 
 		if msg != nil {
 			data := msg.GetData()
@@ -206,7 +208,7 @@ func (a *amqpPubSub) subscribeForever(ctx context.Context, receiver *amqp.Receiv
 
 			pubsubMsg := &pubsub.NewMessage{
 				Data:  data,
-				Topic: msg.LinkName(),
+				Topic: receiver.LinkName(),
 			}
 
 			if err != nil {
@@ -222,7 +224,7 @@ func (a *amqpPubSub) subscribeForever(ctx context.Context, receiver *amqp.Receiv
 					a.logger.Errorf("failed to acknowledge a message")
 				}
 			} else {
-				a.logger.Errorf("Error processing message from %s", msg.LinkName())
+				a.logger.Errorf("Error processing message from %s", receiver.LinkName())
 				a.logger.Debugf("NAKd a message")
 				err := receiver.RejectMessage(ctx, msg, nil)
 				if err != nil {
@@ -235,15 +237,15 @@ func (a *amqpPubSub) subscribeForever(ctx context.Context, receiver *amqp.Receiv
 
 // Connect to the AMQP broker
 func (a *amqpPubSub) connect(ctx context.Context) (*amqp.Session, error) {
-	uri, err := url.Parse(a.metadata.url)
+	uri, err := url.Parse(a.metadata.URL)
 	if err != nil {
 		return nil, err
 	}
 
 	clientOpts := a.createClientOptions(uri)
 
-	a.logger.Infof("Attempting to connect to %s", a.metadata.url)
-	client, err := amqp.Dial(a.metadata.url, &clientOpts)
+	a.logger.Infof("Attempting to connect to %s", a.metadata.URL)
+	client, err := amqp.Dial(ctx, a.metadata.URL, &clientOpts)
 	if err != nil {
 		a.logger.Fatal("Dialing AMQP server:", err)
 	}
@@ -260,8 +262,8 @@ func (a *amqpPubSub) connect(ctx context.Context) (*amqp.Session, error) {
 func (a *amqpPubSub) newTLSConfig() *tls.Config {
 	tlsConfig := new(tls.Config)
 
-	if a.metadata.clientCert != "" && a.metadata.clientKey != "" {
-		cert, err := tls.X509KeyPair([]byte(a.metadata.clientCert), []byte(a.metadata.clientKey))
+	if a.metadata.ClientCert != "" && a.metadata.ClientKey != "" {
+		cert, err := tls.X509KeyPair([]byte(a.metadata.ClientCert), []byte(a.metadata.ClientKey))
 		if err != nil {
 			a.logger.Warnf("unable to load client certificate and key pair. Err: %v", err)
 
@@ -270,9 +272,9 @@ func (a *amqpPubSub) newTLSConfig() *tls.Config {
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
-	if a.metadata.caCert != "" {
+	if a.metadata.CaCert != "" {
 		tlsConfig.RootCAs = x509.NewCertPool()
-		if ok := tlsConfig.RootCAs.AppendCertsFromPEM([]byte(a.metadata.caCert)); !ok {
+		if ok := tlsConfig.RootCAs.AppendCertsFromPEM([]byte(a.metadata.CaCert)); !ok {
 			a.logger.Warnf("unable to load ca certificate.")
 		}
 	}
@@ -287,13 +289,13 @@ func (a *amqpPubSub) createClientOptions(uri *url.URL) amqp.ConnOptions {
 
 	switch scheme {
 	case "amqp":
-		if a.metadata.anonymous {
+		if a.metadata.Anonymous {
 			opts.SASLType = amqp.SASLTypeAnonymous()
 		} else {
-			opts.SASLType = amqp.SASLTypePlain(a.metadata.username, a.metadata.password)
+			opts.SASLType = amqp.SASLTypePlain(a.metadata.Username, a.metadata.Password)
 		}
 	case "amqps":
-		opts.SASLType = amqp.SASLTypePlain(a.metadata.username, a.metadata.password)
+		opts.SASLType = amqp.SASLTypePlain(a.metadata.Username, a.metadata.Password)
 		opts.TLSConfig = a.newTLSConfig()
 	}
 
@@ -322,4 +324,11 @@ func (a *amqpPubSub) Close() error {
 // Feature list for AMQP PubSub
 func (a *amqpPubSub) Features() []pubsub.Feature {
 	return []pubsub.Feature{pubsub.FeatureSubscribeWildcards, pubsub.FeatureMessageTTL}
+}
+
+// GetComponentMetadata returns the metadata of the component.
+func (a *amqpPubSub) GetComponentMetadata() (metadataInfo contribMetadata.MetadataMap) {
+	metadataStruct := metadata{}
+	contribMetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, contribMetadata.PubSubType)
+	return
 }

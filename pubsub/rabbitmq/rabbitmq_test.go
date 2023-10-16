@@ -36,20 +36,19 @@ func newBroker() *rabbitMQInMemoryBroker {
 	}
 }
 
-func newRabbitMQTest(broker *rabbitMQInMemoryBroker) pubsub.PubSub {
+func newRabbitMQTest(broker *rabbitMQInMemoryBroker) *rabbitMQ {
 	return &rabbitMQ{
 		declaredExchanges: make(map[string]bool),
 		logger:            logger.NewLogger("test"),
-		connectionDial: func(protocol, uri string, tlsCfg *tls.Config) (rabbitMQConnectionBroker, rabbitMQChannelBroker, error) {
+		connectionDial: func(protocol, uri, clientName string, heartBeat time.Duration, tlsCfg *tls.Config, externalSasl bool) (rabbitMQConnectionBroker, rabbitMQChannelBroker, error) {
 			broker.connectCount.Add(1)
-
 			return broker, broker, nil
 		},
 		closeCh: make(chan struct{}),
 	}
 }
 
-func TestNoConsumer(t *testing.T) {
+func TestNoConsumerOrQueueName(t *testing.T) {
 	broker := newBroker()
 	pubsubRabbitMQ := newRabbitMQTest(broker)
 	metadata := pubsub.Metadata{Base: mdata.Base{
@@ -60,56 +59,10 @@ func TestNoConsumer(t *testing.T) {
 	err := pubsubRabbitMQ.Init(context.Background(), metadata)
 	assert.NoError(t, err)
 	err = pubsubRabbitMQ.Subscribe(context.Background(), pubsub.SubscribeRequest{}, nil)
-	assert.Contains(t, err.Error(), "consumerID is required for subscriptions")
+	assert.Contains(t, err.Error(), "consumerID is required for subscriptions that don't specify a queue name")
 }
 
-func TestConcurrencyMode(t *testing.T) {
-	t.Run("parallel", func(t *testing.T) {
-		broker := newBroker()
-		pubsubRabbitMQ := newRabbitMQTest(broker)
-		metadata := pubsub.Metadata{Base: mdata.Base{
-			Properties: map[string]string{
-				metadataHostnameKey:   "anyhost",
-				metadataConsumerIDKey: "consumer",
-				pubsub.ConcurrencyKey: string(pubsub.Parallel),
-			},
-		}}
-		err := pubsubRabbitMQ.Init(context.Background(), metadata)
-		assert.Nil(t, err)
-		assert.Equal(t, pubsub.Parallel, pubsubRabbitMQ.(*rabbitMQ).metadata.concurrency)
-	})
-
-	t.Run("single", func(t *testing.T) {
-		broker := newBroker()
-		pubsubRabbitMQ := newRabbitMQTest(broker)
-		metadata := pubsub.Metadata{Base: mdata.Base{
-			Properties: map[string]string{
-				metadataHostnameKey:   "anyhost",
-				metadataConsumerIDKey: "consumer",
-				pubsub.ConcurrencyKey: string(pubsub.Single),
-			},
-		}}
-		err := pubsubRabbitMQ.Init(context.Background(), metadata)
-		assert.Nil(t, err)
-		assert.Equal(t, pubsub.Single, pubsubRabbitMQ.(*rabbitMQ).metadata.concurrency)
-	})
-
-	t.Run("default", func(t *testing.T) {
-		broker := newBroker()
-		pubsubRabbitMQ := newRabbitMQTest(broker)
-		metadata := pubsub.Metadata{Base: mdata.Base{
-			Properties: map[string]string{
-				metadataHostnameKey:   "anyhost",
-				metadataConsumerIDKey: "consumer",
-			},
-		}}
-		err := pubsubRabbitMQ.Init(context.Background(), metadata)
-		assert.Nil(t, err)
-		assert.Equal(t, pubsub.Parallel, pubsubRabbitMQ.(*rabbitMQ).metadata.concurrency)
-	})
-}
-
-func TestPublishAndSubscribe(t *testing.T) {
+func TestPublishAndSubscribeWithPriorityQueue(t *testing.T) {
 	broker := newBroker()
 	pubsubRabbitMQ := newRabbitMQTest(broker)
 	metadata := pubsub.Metadata{Base: mdata.Base{
@@ -136,20 +89,175 @@ func TestPublishAndSubscribe(t *testing.T) {
 		return nil
 	}
 
-	err = pubsubRabbitMQ.Subscribe(context.Background(), pubsub.SubscribeRequest{Topic: topic}, handler)
+	err = pubsubRabbitMQ.Subscribe(context.Background(), pubsub.SubscribeRequest{Topic: topic, Metadata: map[string]string{metadataMaxPriority: "5"}}, handler)
 	assert.Nil(t, err)
 
-	err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: topic, Data: []byte("hello world")})
+	err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: topic, Data: []byte("hello world"), Metadata: map[string]string{metadataMaxPriority: "5"}})
 	assert.Nil(t, err)
 	<-processed
 	assert.Equal(t, 1, messageCount)
 	assert.Equal(t, "hello world", lastMessage)
 
-	err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: topic, Data: []byte("foo bar")})
-	assert.Nil(t, err)
+	// subscribe using classic queue type
+	err = pubsubRabbitMQ.Subscribe(context.Background(), pubsub.SubscribeRequest{Topic: topic, Metadata: map[string]string{reqMetadataQueueTypeKey: "classic"}}, handler)
+	assert.NoError(t, err)
+
+	// publish using classic queue type
+	err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: topic, Data: []byte("hey there"), Metadata: map[string]string{reqMetadataQueueTypeKey: "classic"}})
+	assert.NoError(t, err)
 	<-processed
 	assert.Equal(t, 2, messageCount)
+	assert.Equal(t, "hey there", lastMessage)
+
+	// subscribe using quorum queue type
+	err = pubsubRabbitMQ.Subscribe(context.Background(), pubsub.SubscribeRequest{Topic: topic, Metadata: map[string]string{reqMetadataQueueTypeKey: "quorum"}}, handler)
+	assert.NoError(t, err)
+
+	// publish using quorum queue type
+	err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: topic, Data: []byte("hello friends"), Metadata: map[string]string{reqMetadataQueueTypeKey: "quorum"}})
+	assert.NoError(t, err)
+	<-processed
+	assert.Equal(t, 3, messageCount)
+	assert.Equal(t, "hello friends", lastMessage)
+
+	// trying to subscribe using invalid queue type
+	err = pubsubRabbitMQ.Subscribe(context.Background(), pubsub.SubscribeRequest{Topic: topic, Metadata: map[string]string{reqMetadataQueueTypeKey: "invalid"}}, handler)
+	assert.Error(t, err)
+
+	err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: topic, Data: []byte("foo bar")})
+	assert.NoError(t, err)
+	<-processed
+	assert.Equal(t, 4, messageCount)
 	assert.Equal(t, "foo bar", lastMessage)
+}
+
+func TestConcurrencyMode(t *testing.T) {
+	t.Run("parallel", func(t *testing.T) {
+		broker := newBroker()
+		pubsubRabbitMQ := newRabbitMQTest(broker)
+		metadata := pubsub.Metadata{Base: mdata.Base{
+			Properties: map[string]string{
+				metadataHostnameKey:   "anyhost",
+				metadataConsumerIDKey: "consumer",
+				pubsub.ConcurrencyKey: string(pubsub.Parallel),
+			},
+		}}
+		err := pubsubRabbitMQ.Init(context.Background(), metadata)
+		assert.Nil(t, err)
+		assert.Equal(t, pubsub.Parallel, pubsubRabbitMQ.metadata.Concurrency)
+	})
+
+	t.Run("single", func(t *testing.T) {
+		broker := newBroker()
+		pubsubRabbitMQ := newRabbitMQTest(broker)
+		metadata := pubsub.Metadata{Base: mdata.Base{
+			Properties: map[string]string{
+				metadataHostnameKey:   "anyhost",
+				metadataConsumerIDKey: "consumer",
+				pubsub.ConcurrencyKey: string(pubsub.Single),
+			},
+		}}
+		err := pubsubRabbitMQ.Init(context.Background(), metadata)
+		assert.Nil(t, err)
+		assert.Equal(t, pubsub.Single, pubsubRabbitMQ.metadata.Concurrency)
+	})
+
+	t.Run("default", func(t *testing.T) {
+		broker := newBroker()
+		pubsubRabbitMQ := newRabbitMQTest(broker)
+		metadata := pubsub.Metadata{Base: mdata.Base{
+			Properties: map[string]string{
+				metadataHostnameKey:   "anyhost",
+				metadataConsumerIDKey: "consumer",
+			},
+		}}
+		err := pubsubRabbitMQ.Init(context.Background(), metadata)
+		assert.Nil(t, err)
+		assert.Equal(t, pubsub.Parallel, pubsubRabbitMQ.metadata.Concurrency)
+	})
+}
+
+func TestPublishAndSubscribe(t *testing.T) {
+	tests := []struct {
+		name              string
+		componentMetadata map[string]string
+		subscribeMetadata map[string]string
+		topic             string
+		declaredQueues    []string
+	}{
+		{
+			name: "only consumer id",
+			componentMetadata: map[string]string{
+				metadataHostnameKey:   "anyhost",
+				metadataConsumerIDKey: "consumer",
+			},
+			topic:          "mytopic",
+			declaredQueues: []string{"consumer-mytopic"},
+		},
+		{
+			name: "only queue name",
+			componentMetadata: map[string]string{
+				metadataHostnameKey: "anyhost",
+			},
+			subscribeMetadata: map[string]string{
+				metadataQueueNameKey: "myqueue",
+			},
+			topic:          "mytopic",
+			declaredQueues: []string{"myqueue"},
+		},
+		{
+			name: "queue name takes precedence over consumer id",
+			componentMetadata: map[string]string{
+				metadataHostnameKey:   "anyhost",
+				metadataConsumerIDKey: "consumer",
+			},
+			subscribeMetadata: map[string]string{
+				metadataQueueNameKey: "myqueue",
+			},
+			topic:          "mytopic",
+			declaredQueues: []string{"myqueue"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broker := newBroker()
+			pubsubRabbitMQ := newRabbitMQTest(broker)
+			metadata := pubsub.Metadata{Base: mdata.Base{
+				Properties: test.componentMetadata,
+			}}
+			err := pubsubRabbitMQ.Init(context.Background(), metadata)
+			assert.Nil(t, err)
+			assert.Equal(t, int32(1), broker.connectCount.Load())
+			assert.Equal(t, int32(0), broker.closeCount.Load())
+
+			messageCount := 0
+			lastMessage := ""
+			processed := make(chan bool)
+			handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
+				messageCount++
+				lastMessage = string(msg.Data)
+				processed <- true
+				return nil
+			}
+
+			err = pubsubRabbitMQ.Subscribe(context.Background(), pubsub.SubscribeRequest{Topic: test.topic, Metadata: test.subscribeMetadata}, handler)
+			assert.NoError(t, err)
+			assert.True(t, pubsubRabbitMQ.declaredExchanges[test.topic])
+			assert.ElementsMatch(t, test.declaredQueues, broker.declaredQueues)
+
+			err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: test.topic, Data: []byte("hello world")})
+			assert.NoError(t, err)
+			<-processed
+			assert.Equal(t, 1, messageCount)
+			assert.Equal(t, "hello world", lastMessage)
+
+			err = pubsubRabbitMQ.Publish(context.Background(), &pubsub.PublishRequest{Topic: test.topic, Data: []byte("foo bar")})
+			assert.NoError(t, err)
+			<-processed
+			assert.Equal(t, 2, messageCount)
+			assert.Equal(t, "foo bar", lastMessage)
+		})
+	}
 }
 
 func TestPublishReconnect(t *testing.T) {
@@ -343,10 +451,10 @@ func createAMQPMessage(body []byte) amqp.Delivery {
 }
 
 type rabbitMQInMemoryBroker struct {
-	buffer chan amqp.Delivery
-
-	connectCount atomic.Int32
-	closeCount   atomic.Int32
+	buffer         chan amqp.Delivery
+	declaredQueues []string
+	connectCount   atomic.Int32
+	closeCount     atomic.Int32
 }
 
 func (r *rabbitMQInMemoryBroker) Qos(prefetchCount, prefetchSize int, global bool) error {
@@ -370,6 +478,7 @@ func (r *rabbitMQInMemoryBroker) PublishWithDeferredConfirmWithContext(ctx conte
 }
 
 func (r *rabbitMQInMemoryBroker) QueueDeclare(name string, durable bool, autoDelete bool, exclusive bool, noWait bool, args amqp.Table) (amqp.Queue, error) {
+	r.declaredQueues = append(r.declaredQueues, name)
 	return amqp.Queue{Name: name}, nil
 }
 

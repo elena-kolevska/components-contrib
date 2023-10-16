@@ -40,7 +40,6 @@ import (
 	state_postgres "github.com/dapr/components-contrib/internal/component/postgresql"
 	"github.com/dapr/components-contrib/state"
 	state_loader "github.com/dapr/dapr/pkg/components/state"
-	"github.com/dapr/dapr/pkg/runtime"
 	dapr_testing "github.com/dapr/dapr/pkg/testing"
 	"github.com/dapr/go-sdk/client"
 	"github.com/dapr/kit/logger"
@@ -371,7 +370,7 @@ func TestPostgreSQL(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.Equal(t, expectedEtag, *resp.ETag)
-		assert.Equal(t, "\"v2\"", string(resp.Data))
+		assert.Equal(t, `"v2"`, string(resp.Data))
 
 		return nil
 	}
@@ -379,51 +378,36 @@ func TestPostgreSQL(t *testing.T) {
 	transactionsTest := func(ctx flow.Context) error {
 		err := stateStore.Multi(context.Background(), &state.TransactionalStateRequest{
 			Operations: []state.TransactionalStateOperation{
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   "reqKey1",
-						Value: "reqVal1",
-						Metadata: map[string]string{
-							"ttlInSeconds": "-1",
-						},
+				state.SetRequest{
+					Key:   "reqKey1",
+					Value: "reqVal1",
+					Metadata: map[string]string{
+						"ttlInSeconds": "-1",
 					},
 				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   "reqKey2",
-						Value: "reqVal2",
-						Metadata: map[string]string{
-							"ttlInSeconds": "222",
-						},
+				state.SetRequest{
+					Key:   "reqKey2",
+					Value: "reqVal2",
+					Metadata: map[string]string{
+						"ttlInSeconds": "222",
 					},
 				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   "reqKey3",
-						Value: "reqVal3",
+				state.SetRequest{
+					Key:   "reqKey3",
+					Value: "reqVal3",
+				},
+				state.SetRequest{
+					Key:   "reqKey1",
+					Value: "reqVal101",
+					Metadata: map[string]string{
+						"ttlInSeconds": "50",
 					},
 				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   "reqKey1",
-						Value: "reqVal101",
-						Metadata: map[string]string{
-							"ttlInSeconds": "50",
-						},
-					},
-				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   "reqKey3",
-						Value: "reqVal103",
-						Metadata: map[string]string{
-							"ttlInSeconds": "50",
-						},
+				state.SetRequest{
+					Key:   "reqKey3",
+					Value: "reqVal103",
+					Metadata: map[string]string{
+						"ttlInSeconds": "50",
 					},
 				},
 			},
@@ -439,6 +423,9 @@ func TestPostgreSQL(t *testing.T) {
 			Key: "reqKey3",
 		})
 		assert.Equal(t, "\"reqVal103\"", string(resp3.Data))
+		require.Contains(t, resp3.Metadata, "ttlExpireTime")
+		expireTime, err := time.Parse(time.RFC3339, resp3.Metadata["ttlExpireTime"])
+		assert.InDelta(t, time.Now().Add(50*time.Second).Unix(), expireTime.Unix(), 5)
 		return nil
 	}
 
@@ -511,10 +498,7 @@ func TestPostgreSQL(t *testing.T) {
 				require.NoError(t, err, "failed to init")
 				defer storeObj.Close()
 
-				dbAccess := storeObj.GetDBAccess().(*state_postgres.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-
-				cleanupInterval := dbAccess.GetCleanupInterval()
+				cleanupInterval := storeObj.GetCleanupInterval()
 				_ = assert.NotNil(t, cleanupInterval) &&
 					assert.Equal(t, time.Duration(1*time.Hour), *cleanupInterval)
 			})
@@ -528,10 +512,7 @@ func TestPostgreSQL(t *testing.T) {
 				require.NoError(t, err, "failed to init")
 				defer storeObj.Close()
 
-				dbAccess := storeObj.GetDBAccess().(*state_postgres.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-
-				cleanupInterval := dbAccess.GetCleanupInterval()
+				cleanupInterval := storeObj.GetCleanupInterval()
 				_ = assert.NotNil(t, cleanupInterval) &&
 					assert.Equal(t, time.Duration(10*time.Second), *cleanupInterval)
 			})
@@ -545,10 +526,7 @@ func TestPostgreSQL(t *testing.T) {
 				require.NoError(t, err, "failed to init")
 				defer storeObj.Close()
 
-				dbAccess := storeObj.GetDBAccess().(*state_postgres.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-
-				cleanupInterval := dbAccess.GetCleanupInterval()
+				cleanupInterval := storeObj.GetCleanupInterval()
 				_ = assert.Nil(t, cleanupInterval)
 			})
 
@@ -612,9 +590,6 @@ func TestPostgreSQL(t *testing.T) {
 				require.NoError(t, err, "failed to init")
 				defer storeObj.Close()
 
-				dbAccess := storeObj.GetDBAccess().(*state_postgres.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-
 				// Seed the database with some records
 				err = populateTTLRecords(ctx, dbClient)
 				require.NoError(t, err, "failed to seed records")
@@ -637,7 +612,7 @@ func TestPostgreSQL(t *testing.T) {
 				require.NotEmpty(t, lastCleanupValueOrig)
 
 				// Trigger the background cleanup, which should do nothing because the last cleanup was < 3600s
-				err = dbAccess.CleanupExpired(ctx)
+				err = storeObj.CleanupExpired()
 				require.NoError(t, err, "CleanupExpired returned an error")
 
 				// Validate that 20 records are still present
@@ -663,9 +638,9 @@ func TestPostgreSQL(t *testing.T) {
 		Step("run Init test", initTest).
 		Step(sidecar.Run(sidecarNamePrefix+"dockerDefault",
 			embedded.WithoutApp(),
-			embedded.WithDaprGRPCPort(currentGrpcPort),
+			embedded.WithDaprGRPCPort(strconv.Itoa(currentGrpcPort)),
 			embedded.WithComponentsPath("components/docker/default"),
-			runtime.WithStates(stateRegistry),
+			embedded.WithStates(stateRegistry),
 		)).
 		Step("run CRUD test", basicTest).
 		Step("run eTag test", eTagTest).

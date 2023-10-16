@@ -18,17 +18,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/dapr/dapr/pkg/runtime"
-	dapr_testing "github.com/dapr/dapr/pkg/testing"
-	goclient "github.com/dapr/go-sdk/client"
-	"github.com/dapr/kit/logger"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	// Blank import for the underlying PostgreSQL driver.
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/dapr/components-contrib/internal/component/postgresql"
 	"github.com/dapr/components-contrib/metadata"
@@ -39,6 +39,9 @@ import (
 	"github.com/dapr/components-contrib/tests/certification/flow/dockercompose"
 	"github.com/dapr/components-contrib/tests/certification/flow/sidecar"
 	state_loader "github.com/dapr/dapr/pkg/components/state"
+	dapr_testing "github.com/dapr/dapr/pkg/testing"
+	goclient "github.com/dapr/go-sdk/client"
+	"github.com/dapr/kit/logger"
 )
 
 const (
@@ -135,7 +138,7 @@ func TestCockroach(t *testing.T) {
 		return nil
 	}
 
-	//ETag test
+	// ETag test
 	eTagTest := func(ctx flow.Context) error {
 		etag1 := "1"
 		etag100 := "100"
@@ -153,14 +156,14 @@ func TestCockroach(t *testing.T) {
 			Value: "v3",
 			ETag:  &etag100,
 		})
-		assert.Equal(t, fmt.Errorf("no item was updated"), err)
+		assert.Equal(t, state.NewETagError(state.ETagMismatch, nil), err)
 
 		resp, err := stateStore.Get(context.Background(), &state.GetRequest{
 			Key: keyOneString,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, etag1, *resp.ETag)           //1 is returned since the default when the new data is written is a value of 1
-		assert.Equal(t, "\"v1\"", string(resp.Data)) //v1 is returned since it was the only item successfully inserted with the key of keyOneString
+		assert.Equal(t, etag1, *resp.ETag)           // 1 is returned since the default when the new data is written is a value of 1
+		assert.Equal(t, "\"v1\"", string(resp.Data)) // v1 is returned since it was the only item successfully inserted with the key of keyOneString
 
 		// This will update the value stored in key K with "Overwrite Success" since the previously created etag has a value of 1
 		// It will also increment the etag stored by a value of 1
@@ -175,7 +178,7 @@ func TestCockroach(t *testing.T) {
 			Key: keyOneString,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, "2", *resp.ETag) //2 is returned since the previous etag value of "1" was incremented by 1 when the update occurred
+		assert.Equal(t, "2", *resp.ETag) // 2 is returned since the previous etag value of "1" was incremented by 1 when the update occurred
 		assert.Equal(t, "\"Overwrite Success\"", string(resp.Data))
 
 		return nil
@@ -194,51 +197,41 @@ func TestCockroach(t *testing.T) {
 
 		err = stateStore.Multi(context.Background(), &state.TransactionalStateRequest{
 			Operations: []state.TransactionalStateOperation{
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:      "reqKey1",
-						Value:    "reqVal1",
-						Metadata: map[string]string{},
+				state.SetRequest{
+					Key:   "reqKey1",
+					Value: "reqVal1",
+					Metadata: map[string]string{
+						"ttlInSeconds": "-1",
 					},
 				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:      "reqKey2",
-						Value:    "reqVal2",
-						Metadata: map[string]string{},
+				state.SetRequest{
+					Key:   "reqKey2",
+					Value: "reqVal2",
+					Metadata: map[string]string{
+						"ttlInSeconds": "222",
 					},
 				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:   "reqKey3",
-						Value: "reqVal3",
+				state.SetRequest{
+					Key:   "reqKey3",
+					Value: "reqVal3",
+				},
+				state.SetRequest{
+					Key:   "reqKey1",
+					Value: "reqVal101",
+					Metadata: map[string]string{
+						"ttlInSeconds": "50",
 					},
 				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:      "reqKey1",
-						Value:    "reqVal101",
-						Metadata: map[string]string{},
+				state.SetRequest{
+					Key:   "reqKey3",
+					Value: "reqVal103",
+					Metadata: map[string]string{
+						"ttlInSeconds": "50",
 					},
 				},
-				{
-					Operation: state.Upsert,
-					Request: state.SetRequest{
-						Key:      "reqKey3",
-						Value:    "reqVal103",
-						Metadata: map[string]string{},
-					},
-				},
-				{
-					Operation: state.Delete,
-					Request: state.DeleteRequest{
-						Key:      certificationTestPrefix + "key1",
-						Metadata: map[string]string{},
-					},
+				state.DeleteRequest{
+					Key:      certificationTestPrefix + "key1",
+					Metadata: map[string]string{},
 				},
 			},
 		})
@@ -262,6 +255,9 @@ func TestCockroach(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "2", *resp3.ETag)
 		assert.Equal(t, "\"reqVal103\"", string(resp3.Data))
+		require.Contains(t, resp3.Metadata, "ttlExpireTime")
+		expireTime, err := time.Parse(time.RFC3339, resp3.Metadata["ttlExpireTime"])
+		assert.InDelta(t, time.Now().Add(50*time.Second).Unix(), expireTime.Unix(), 5)
 		return nil
 	}
 
@@ -288,10 +284,7 @@ func TestCockroach(t *testing.T) {
 				require.NoError(t, err, "failed to init")
 				defer storeObj.Close()
 
-				dbAccess := storeObj.GetDBAccess().(*postgresql.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-
-				cleanupInterval := dbAccess.GetCleanupInterval()
+				cleanupInterval := storeObj.GetCleanupInterval()
 				require.NotNil(t, cleanupInterval)
 				assert.Equal(t, time.Duration(1*time.Hour), *cleanupInterval)
 			})
@@ -305,10 +298,7 @@ func TestCockroach(t *testing.T) {
 				require.NoError(t, err, "failed to init")
 				defer storeObj.Close()
 
-				dbAccess := storeObj.GetDBAccess().(*postgresql.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-
-				cleanupInterval := dbAccess.GetCleanupInterval()
+				cleanupInterval := storeObj.GetCleanupInterval()
 				require.NotNil(t, cleanupInterval)
 				assert.Equal(t, time.Duration(10*time.Second), *cleanupInterval)
 			})
@@ -322,10 +312,7 @@ func TestCockroach(t *testing.T) {
 				require.NoError(t, err, "failed to init")
 				defer storeObj.Close()
 
-				dbAccess := storeObj.GetDBAccess().(*postgresql.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-
-				cleanupInterval := dbAccess.GetCleanupInterval()
+				cleanupInterval := storeObj.GetCleanupInterval()
 				_ = assert.Nil(t, cleanupInterval)
 			})
 		})
@@ -412,9 +399,7 @@ func TestCockroach(t *testing.T) {
 				require.NotEmpty(t, lastCleanupValueOrig)
 
 				// Trigger the background cleanup, which should do nothing because the last cleanup was < 3600s
-				dbAccess := storeObj.GetDBAccess().(*postgresql.PostgresDBAccess)
-				require.NotNil(t, dbAccess)
-				err = dbAccess.CleanupExpired(ctx)
+				err = storeObj.CleanupExpired()
 				require.NoError(t, err, "CleanupExpired returned an error")
 
 				// Validate that 20 records are still present
@@ -437,10 +422,10 @@ func TestCockroach(t *testing.T) {
 		Step("Waiting for cockroachdb readiness", flow.Sleep(30*time.Second)).
 		Step(sidecar.Run(sidecarNamePrefix+"dockerDefault",
 			embedded.WithoutApp(),
-			embedded.WithDaprGRPCPort(currentGrpcPort),
-			embedded.WithDaprHTTPPort(currentHTTPPort),
+			embedded.WithDaprGRPCPort(strconv.Itoa(currentGrpcPort)),
+			embedded.WithDaprHTTPPort(strconv.Itoa(currentHTTPPort)),
 			embedded.WithComponentsPath("components/standard"),
-			runtime.WithStates(stateRegistry),
+			embedded.WithStates(stateRegistry),
 		)).
 		Step("connect to the database", connectStep).
 		Step("Run basic test", basicTest).

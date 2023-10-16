@@ -20,7 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +29,7 @@ import (
 	// Blank import for the underlying SQLite Driver.
 	_ "modernc.org/sqlite"
 
+	internalsql "github.com/dapr/components-contrib/internal/component/sql"
 	"github.com/dapr/components-contrib/state"
 	stateutils "github.com/dapr/components-contrib/state/utils"
 	"github.com/dapr/kit/logger"
@@ -41,6 +42,7 @@ type DBAccess interface {
 	Set(ctx context.Context, req *state.SetRequest) error
 	Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error)
 	Delete(ctx context.Context, req *state.DeleteRequest) error
+	BulkGet(ctx context.Context, req []state.GetRequest) ([]state.BulkGetResponse, error)
 	ExecuteMulti(ctx context.Context, reqs []state.TransactionalStateOperation) error
 	Close() error
 }
@@ -57,8 +59,7 @@ type sqliteDBAccess struct {
 	logger   logger.Logger
 	metadata sqliteMetadataStruct
 	db       *sql.DB
-	ctx      context.Context
-	cancel   context.CancelFunc
+	gc       internalsql.GarbageCollector
 }
 
 // newSqliteDBAccess creates a new instance of sqliteDbAccess.
@@ -76,7 +77,7 @@ func (a *sqliteDBAccess) Init(ctx context.Context, md state.Metadata) error {
 		return err
 	}
 
-	connString, err := a.getConnectionString()
+	connString, err := a.metadata.GetConnectionString(a.logger)
 	if err != nil {
 		// Already logged
 		return err
@@ -88,131 +89,55 @@ func (a *sqliteDBAccess) Init(ctx context.Context, md state.Metadata) error {
 	}
 
 	a.db = db
-	a.ctx, a.cancel = context.WithCancel(context.Background())
 
-	err = a.Ping(a.ctx)
+	err = a.Ping(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to ping: %w", err)
 	}
 
 	// Performs migrations
-	migrate := &migrations{
-		Logger:            a.logger,
-		Conn:              a.db,
-		MetadataTableName: a.metadata.MetadataTableName,
+	err = performMigrations(ctx, a.db, a.logger, migrationOptions{
 		StateTableName:    a.metadata.TableName,
-	}
-	err = migrate.Perform(ctx)
+		MetadataTableName: a.metadata.MetadataTableName,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to perform migrations: %w", err)
 	}
 
-	a.scheduleCleanupExpiredData()
+	gc, err := internalsql.ScheduleGarbageCollector(internalsql.GCOptions{
+		Logger: a.logger,
+		UpdateLastCleanupQuery: func(arg any) (string, any) {
+			return fmt.Sprintf(`INSERT INTO %s (key, value)
+				VALUES ('last-cleanup', CURRENT_TIMESTAMP)
+				ON CONFLICT (key)
+				DO UPDATE SET value = CURRENT_TIMESTAMP
+					WHERE (unixepoch(CURRENT_TIMESTAMP) - unixepoch(value)) * 1000 > ?;`,
+				a.metadata.MetadataTableName,
+			), arg
+		},
+		DeleteExpiredValuesQuery: fmt.Sprintf(`DELETE FROM %s
+		WHERE
+			expiration_time IS NOT NULL
+			AND expiration_time < CURRENT_TIMESTAMP`,
+			a.metadata.TableName,
+		),
+		CleanupInterval: a.metadata.CleanupInterval,
+		DB:              internalsql.AdaptDatabaseSQLConn(a.db),
+	})
+	if err != nil {
+		return err
+	}
+	a.gc = gc
 
 	return nil
 }
 
-func (a *sqliteDBAccess) getConnectionString() (string, error) {
-	// Check if we're using the in-memory database
-	lc := strings.ToLower(a.metadata.ConnectionString)
-	isMemoryDB := strings.HasPrefix(lc, ":memory:") || strings.HasPrefix(lc, "file::memory:")
-
-	// Get the "query string" from the connection string if present
-	idx := strings.IndexRune(a.metadata.ConnectionString, '?')
-	var qs url.Values
-	if idx > 0 {
-		qs, _ = url.ParseQuery(a.metadata.ConnectionString[(idx + 1):])
-	}
-	if len(qs) == 0 {
-		qs = make(url.Values, 2)
-	}
-
-	// If the database is in-memory, we must ensure that cache=shared is set
-	if isMemoryDB {
-		qs["cache"] = []string{"shared"}
-	}
-
-	// Check if the database is read-only or immutable
-	isReadOnly := false
-	if len(qs["mode"]) > 0 {
-		// Keep the first value only
-		qs["mode"] = []string{
-			qs["mode"][0],
-		}
-		if qs["mode"][0] == "ro" {
-			isReadOnly = true
-		}
-	}
-	if len(qs["immutable"]) > 0 {
-		// Keep the first value only
-		qs["immutable"] = []string{
-			qs["immutable"][0],
-		}
-		if qs["immutable"][0] == "1" {
-			isReadOnly = true
-		}
-	}
-
-	// We do not want to override a _txlock if set, but we'll show a warning if it's not "immediate"
-	if len(qs["_txlock"]) > 0 {
-		// Keep the first value only
-		qs["_txlock"] = []string{
-			strings.ToLower(qs["_txlock"][0]),
-		}
-		if qs["_txlock"][0] != "immediate" {
-			a.logger.Warn("Database connection is being created with a _txlock different from the recommended value 'immediate'")
-		}
-	} else {
-		qs["_txlock"] = []string{"immediate"}
-	}
-
-	// Add pragma values
-	if len(qs["_pragma"]) == 0 {
-		qs["_pragma"] = make([]string, 0, 2)
-	} else {
-		for _, p := range qs["_pragma"] {
-			p = strings.ToLower(p)
-			if strings.HasPrefix(p, "busy_timeout") {
-				a.logger.Error("Cannot set `_pragma=busy_timeout` option in the connection string; please use the `busyTimeout` metadata property instead")
-				return "", errors.New("found forbidden option '_pragma=busy_timeout' in the connection string")
-			} else if strings.HasPrefix(p, "journal_mode") {
-				a.logger.Error("Cannot set `_pragma=journal_mode` option in the connection string; please use the `disableWAL` metadata property instead")
-				return "", errors.New("found forbidden option '_pragma=journal_mode' in the connection string")
-			}
-		}
-	}
-	if a.metadata.BusyTimeout > 0 {
-		qs["_pragma"] = append(qs["_pragma"], fmt.Sprintf("busy_timeout(%d)", a.metadata.BusyTimeout.Milliseconds()))
-	}
-	if isMemoryDB {
-		// For in-memory databases, set the journal to MEMORY, the only allowed option besides OFF (which would make transactions ineffective)
-		qs["_pragma"] = append(qs["_pragma"], "journal_mode(MEMORY)")
-	} else if a.metadata.DisableWAL || isReadOnly {
-		// Set the journaling mode to "DELETE" (the default) if WAL is disabled or if the database is read-only
-		qs["_pragma"] = append(qs["_pragma"], "journal_mode(DELETE)")
-	} else {
-		// Enable WAL
-		qs["_pragma"] = append(qs["_pragma"], "journal_mode(WAL)")
-	}
-
-	// Build the final connection string
-	connString := a.metadata.ConnectionString
-	if idx > 0 {
-		connString = connString[:idx]
-	}
-	connString += "?" + qs.Encode()
-
-	// If the connection string doesn't begin with "file:", add the prefix
-	if !strings.HasPrefix(lc, "file:") {
-		a.logger.Debug("prefix 'file:' added to the connection string")
-		connString = "file:" + connString
-	}
-
-	return connString, nil
+func (a *sqliteDBAccess) CleanupExpired() error {
+	return a.gc.CleanupExpired()
 }
 
 func (a *sqliteDBAccess) Ping(parentCtx context.Context) error {
-	ctx, cancel := context.WithTimeout(parentCtx, a.metadata.timeout)
+	ctx, cancel := context.WithTimeout(parentCtx, a.metadata.Timeout)
 	err := a.db.PingContext(ctx)
 	cancel()
 	return err
@@ -222,24 +147,16 @@ func (a *sqliteDBAccess) Get(parentCtx context.Context, req *state.GetRequest) (
 	if req.Key == "" {
 		return nil, errors.New("missing key in get operation")
 	}
-	var (
-		value    []byte
-		isBinary bool
-		etag     string
-	)
 
-	// Sprintf is required for table name because sql.DB does not substitute parameters for table names
-	//nolint:gosec
-	stmt := fmt.Sprintf(
-		`SELECT value, is_binary, etag FROM %s
+	// Concatenation is required for table name because sql.DB does not substitute parameters for table names
+	stmt := `SELECT key, value, is_binary, etag, expiration_time FROM ` + a.metadata.TableName + `
 		WHERE
 			key = ?
-			AND (expiration_time IS NULL OR expiration_time > CURRENT_TIMESTAMP)`,
-		a.metadata.TableName)
-	ctx, cancel := context.WithTimeout(parentCtx, a.metadata.timeout)
-	err := a.db.QueryRowContext(ctx, stmt, req.Key).
-		Scan(&value, &isBinary, &etag)
-	cancel()
+			AND (expiration_time IS NULL OR expiration_time > CURRENT_TIMESTAMP)`
+	ctx, cancel := context.WithTimeout(parentCtx, a.metadata.Timeout)
+	defer cancel()
+	row := a.db.QueryRowContext(ctx, stmt, req.Key)
+	_, value, etag, expireTime, err := readRow(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return &state.GetResponse{}, nil
@@ -247,25 +164,120 @@ func (a *sqliteDBAccess) Get(parentCtx context.Context, req *state.GetRequest) (
 		return nil, err
 	}
 
+	var metadata map[string]string
+	if expireTime != nil {
+		metadata = map[string]string{
+			state.GetRespMetaKeyTTLExpireTime: expireTime.UTC().Format(time.RFC3339),
+		}
+	}
+
+	return &state.GetResponse{
+		Data:     value,
+		ETag:     etag,
+		Metadata: metadata,
+	}, nil
+}
+
+func (a *sqliteDBAccess) BulkGet(parentCtx context.Context, req []state.GetRequest) ([]state.BulkGetResponse, error) {
+	if len(req) == 0 {
+		return []state.BulkGetResponse{}, nil
+	}
+
+	// SQLite doesn't support passing an array for an IN clause, so we need to build a custom query
+	inClause := strings.Repeat("?,", len(req))
+	inClause = inClause[:(len(inClause) - 1)]
+	params := make([]any, len(req))
+	for i, r := range req {
+		params[i] = r.Key
+	}
+
+	// Concatenation is required for table name because sql.DB does not substitute parameters for table names
+	stmt := `SELECT key, value, is_binary, etag, expiration_time FROM ` + a.metadata.TableName + `
+		WHERE
+			key IN (` + inClause + `)
+			AND (expiration_time IS NULL OR expiration_time > CURRENT_TIMESTAMP)`
+	ctx, cancel := context.WithTimeout(parentCtx, a.metadata.Timeout)
+	defer cancel()
+	rows, err := a.db.QueryContext(ctx, stmt, params...)
+	if err != nil {
+		return nil, err
+	}
+
+	var n int
+	res := make([]state.BulkGetResponse, len(req))
+	foundKeys := make(map[string]struct{}, len(req))
+	for ; rows.Next(); n++ {
+		if n >= len(req) {
+			// Sanity check to prevent panics, which should never happen
+			return nil, fmt.Errorf("query returned more records than expected (expected %d)", len(req))
+		}
+
+		r := state.BulkGetResponse{}
+		var expireTime *time.Time
+		r.Key, r.Data, r.ETag, expireTime, err = readRow(rows)
+		if err != nil {
+			r.Error = err.Error()
+		}
+		if expireTime != nil {
+			r.Metadata = map[string]string{
+				state.GetRespMetaKeyTTLExpireTime: expireTime.UTC().Format(time.RFC3339),
+			}
+		}
+		res[n] = r
+		foundKeys[r.Key] = struct{}{}
+	}
+
+	// Populate missing keys with empty values
+	// This is to ensure consistency with the other state stores that implement BulkGet as a loop over Get, and with the Get method
+	if len(foundKeys) < len(req) {
+		var ok bool
+		for _, r := range req {
+			_, ok = foundKeys[r.Key]
+			if !ok {
+				if n >= len(req) {
+					// Sanity check to prevent panics, which should never happen
+					return nil, fmt.Errorf("query returned more records than expected (expected %d)", len(req))
+				}
+				res[n] = state.BulkGetResponse{
+					Key: r.Key,
+				}
+				n++
+			}
+		}
+	}
+
+	return res[:n], nil
+}
+
+func readRow(row interface{ Scan(dest ...any) error }) (string, []byte, *string, *time.Time, error) {
+	var (
+		key        string
+		value      []byte
+		isBinary   bool
+		etag       string
+		expire     sql.NullTime
+		expireTime *time.Time
+	)
+	err := row.Scan(&key, &value, &isBinary, &etag, &expire)
+	if err != nil {
+		return key, nil, nil, nil, err
+	}
+
+	if expire.Valid {
+		expireTime = &expire.Time
+	}
+
 	if isBinary {
 		var n int
 		data := make([]byte, len(value))
 		n, err = base64.StdEncoding.Decode(data, value)
 		if err != nil {
-			return nil, err
+			return key, nil, nil, nil, fmt.Errorf("failed to decode binary data: %w", err)
 		}
-		return &state.GetResponse{
-			Data:     data[:n],
-			ETag:     &etag,
-			Metadata: req.Metadata,
-		}, nil
+		return key, data[:n], &etag, expireTime, nil
 	}
 
-	return &state.GetResponse{
-		Data:     value,
-		ETag:     &etag,
-		Metadata: req.Metadata,
-	}, nil
+	return key, value, &etag, expireTime, nil
 }
 
 func (a *sqliteDBAccess) Set(ctx context.Context, req *state.SetRequest) error {
@@ -280,10 +292,6 @@ func (a *sqliteDBAccess) doSet(parentCtx context.Context, db querier, req *state
 
 	if req.Key == "" {
 		return errors.New("missing key in set option")
-	}
-
-	if v, ok := req.Value.(string); ok && v == "" {
-		return fmt.Errorf("empty string is not allowed in set operation")
 	}
 
 	// TTL
@@ -320,61 +328,93 @@ func (a *sqliteDBAccess) doSet(parentCtx context.Context, db querier, req *state
 	// Also resets expiration time in case of an update
 	expiration := "NULL"
 	if ttlSeconds > 0 {
-		expiration = fmt.Sprintf("DATETIME(CURRENT_TIMESTAMP, '+%d seconds')", ttlSeconds)
+		expiration = "DATETIME(CURRENT_TIMESTAMP, '+" + strconv.Itoa(ttlSeconds) + " seconds')"
 	}
 
 	// Only check for etag if FirstWrite specified (ref oracledatabaseaccess)
-	var res sql.Result
+	var (
+		res        sql.Result
+		mustCommit bool
+		stmt       string
+	)
 	// Sprintf is required for table name because sql.DB does not substitute parameters for table names.
 	// And the same is for DATETIME function's seconds parameter (which is from an integer anyways).
-	if req.ETag == nil || *req.ETag == "" {
-		var op string
+	if !req.HasETag() {
+		// If the operation uses first-write concurrency, we need to handle the special case of a row that has expired but hasn't been garbage collected yet
+		// In this case, the row should be considered as if it were deleted
+		// With SQLite, the only way we can handle that is by performing a SELECT query first
 		if req.Options.Concurrency == state.FirstWrite {
-			op = "INSERT"
-		} else {
-			op = "INSERT OR REPLACE"
+			// If we're not in a transaction already, start one as we need to ensure consistency
+			if db == a.db {
+				db, err = a.db.BeginTx(parentCtx, nil)
+				if err != nil {
+					return fmt.Errorf("failed to begin transaction: %w", err)
+				}
+				defer db.(*sql.Tx).Rollback()
+				mustCommit = true
+			}
+
+			// Check if there's already a row with the given key that has not expired yet
+			var count int
+			stmt = `SELECT COUNT(key)
+				FROM ` + a.metadata.TableName + `
+				WHERE key = ?
+					AND (expiration_time IS NULL OR expiration_time > CURRENT_TIMESTAMP)`
+			err = db.QueryRowContext(parentCtx, stmt, req.Key).Scan(&count)
+			if err != nil {
+				return fmt.Errorf("failed to check for existing row with first-write concurrency: %w", err)
+			}
+
+			// If the row exists, then we just return an etag error
+			// Otherwise, we can fall through and continue with an INSERT OR REPLACE statement
+			if count > 0 {
+				return state.NewETagError(state.ETagMismatch, nil)
+			}
 		}
-		stmt := fmt.Sprintf(
-			`%s INTO %s
+
+		stmt = "INSERT OR REPLACE INTO " + a.metadata.TableName + `
 				(key, value, is_binary, etag, update_time, expiration_time)
-			VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP, %s)`,
-			op, a.metadata.TableName, expiration,
-		)
-		ctx, cancel := context.WithTimeout(context.Background(), a.metadata.timeout)
+			VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP, ` + expiration + `)`
+		ctx, cancel := context.WithTimeout(context.Background(), a.metadata.Timeout)
+		defer cancel()
 		res, err = db.ExecContext(ctx, stmt, req.Key, requestValue, isBinary, newEtag, req.Key)
-		cancel()
 	} else {
-		stmt := fmt.Sprintf(
-			`UPDATE %s SET
+		stmt = `UPDATE ` + a.metadata.TableName + ` SET
 				value = ?,
 				etag = ?,
 				is_binary = ?,
 				update_time = CURRENT_TIMESTAMP,
-				expiration_time = %s
+				expiration_time = ` + expiration + `
 			WHERE
 				key = ?
-				AND eTag = ?`,
-			a.metadata.TableName, expiration,
-		)
-		ctx, cancel := context.WithTimeout(context.Background(), a.metadata.timeout)
+				AND etag = ?
+				AND (expiration_time IS NULL OR expiration_time > CURRENT_TIMESTAMP)`
+		ctx, cancel := context.WithTimeout(context.Background(), a.metadata.Timeout)
+		defer cancel()
 		res, err = db.ExecContext(ctx, stmt, requestValue, newEtag, isBinary, req.Key, *req.ETag)
-		cancel()
 	}
-
 	if err != nil {
 		return err
 	}
 
+	// Count the number of affected rows
 	rows, err := res.RowsAffected()
 	if err != nil {
 		return err
 	}
-
 	if rows == 0 {
-		if req.ETag != nil && *req.ETag != "" {
+		if req.HasETag() {
 			return state.NewETagError(state.ETagMismatch, nil)
 		}
 		return errors.New("no item was updated")
+	}
+
+	// Commit the transaction if needed
+	if mustCommit {
+		err = db.(*sql.Tx).Commit()
+		if err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
 	}
 
 	return nil
@@ -391,25 +431,17 @@ func (a *sqliteDBAccess) ExecuteMulti(parentCtx context.Context, reqs []state.Tr
 	}
 	defer tx.Rollback()
 
-	for _, req := range reqs {
-		switch req.Operation {
-		case state.Upsert:
-			if setReq, ok := req.Request.(state.SetRequest); ok {
-				err = a.doSet(parentCtx, tx, &setReq)
-				if err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("expecting set request")
+	for _, o := range reqs {
+		switch req := o.(type) {
+		case state.SetRequest:
+			err = a.doSet(parentCtx, tx, &req)
+			if err != nil {
+				return err
 			}
-		case state.Delete:
-			if delReq, ok := req.Request.(state.DeleteRequest); ok {
-				err = a.doDelete(parentCtx, tx, &delReq)
-				if err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("expecting delete request")
+		case state.DeleteRequest:
+			err = a.doDelete(parentCtx, tx, &req)
+			if err != nil {
+				return err
 			}
 		default:
 			// Do nothing
@@ -420,12 +452,14 @@ func (a *sqliteDBAccess) ExecuteMulti(parentCtx context.Context, reqs []state.Tr
 
 // Close implements io.Close.
 func (a *sqliteDBAccess) Close() error {
-	if a.cancel != nil {
-		a.cancel()
-	}
 	if a.db != nil {
 		_ = a.db.Close()
 	}
+
+	if a.gc != nil {
+		return a.gc.Close()
+	}
+
 	return nil
 }
 
@@ -439,19 +473,17 @@ func (a *sqliteDBAccess) doDelete(parentCtx context.Context, db querier, req *st
 		return fmt.Errorf("missing key in delete operation")
 	}
 
+	ctx, cancel := context.WithTimeout(parentCtx, a.metadata.Timeout)
+	defer cancel()
 	var result sql.Result
-	if req.ETag == nil || *req.ETag == "" {
-		// Sprintf is required for table name because sql.DB does not substitute parameters for table names.
-		stmt := fmt.Sprintf("DELETE FROM %s WHERE key = ?", a.metadata.TableName)
-		ctx, cancel := context.WithTimeout(parentCtx, a.metadata.timeout)
-		result, err = db.ExecContext(ctx, stmt, req.Key)
-		cancel()
+	if !req.HasETag() {
+		// Concatenation is required for table name because sql.DB does not substitute parameters for table names.
+		result, err = db.ExecContext(ctx, "DELETE FROM "+a.metadata.TableName+" WHERE key = ?",
+			req.Key)
 	} else {
-		// Sprintf is required for table name because sql.DB does not substitute parameters for table names.
-		stmt := fmt.Sprintf("DELETE FROM %s WHERE key = ? AND etag = ?", a.metadata.TableName)
-		ctx, cancel := context.WithTimeout(parentCtx, a.metadata.timeout)
-		result, err = db.ExecContext(ctx, stmt, req.Key, *req.ETag)
-		cancel()
+		// Concatenation is required for table name because sql.DB does not substitute parameters for table names.
+		result, err = db.ExecContext(ctx, "DELETE FROM "+a.metadata.TableName+" WHERE key = ? AND etag = ?",
+			req.Key, *req.ETag)
 	}
 
 	if err != nil {
@@ -468,107 +500,6 @@ func (a *sqliteDBAccess) doDelete(parentCtx context.Context, db querier, req *st
 	}
 
 	return nil
-}
-
-func (a *sqliteDBAccess) scheduleCleanupExpiredData() {
-	if a.metadata.CleanupInterval <= 0 {
-		return
-	}
-
-	a.logger.Infof("Schedule expired data clean up every %v", a.metadata.CleanupInterval)
-
-	go func() {
-		ticker := time.NewTicker(a.metadata.CleanupInterval)
-		defer ticker.Stop()
-
-		var err error
-		for {
-			select {
-			case <-ticker.C:
-				err = a.CleanupExpired()
-				if err != nil {
-					a.logger.Errorf("Error removing expired data: %v", err)
-				}
-			case <-a.ctx.Done():
-				a.logger.Debug("Stopped background cleanup of expired data")
-				return
-			}
-		}
-	}()
-}
-
-func (a *sqliteDBAccess) CleanupExpired() error {
-	tx, err := a.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to start transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Check if the last iteration was too recent
-	// This performs an atomic operation, so allows coordination with other daprd processes too
-	// We do this before beginning the transaction
-	canContinue, err := a.UpdateLastCleanup(tx, a.metadata.CleanupInterval)
-	if err != nil {
-		return fmt.Errorf("failed to read last cleanup time from database: %w", err)
-	}
-	if !canContinue {
-		a.logger.Debug("Last cleanup was performed too recently")
-		return nil
-	}
-
-	// Sprintf is required for table name because sql.DB does not substitute parameters for table names
-	//nolint:gosec
-	stmt := fmt.Sprintf(
-		`DELETE FROM %s
-		WHERE
-			expiration_time IS NOT NULL
-			AND expiration_time < CURRENT_TIMESTAMP`,
-		a.metadata.TableName,
-	)
-	// Not we're not using a context here because this query can take a bit of time, especially if there's no index on expiration_time
-	res, err := tx.Exec(stmt)
-	if err != nil {
-		return fmt.Errorf("failed to execute query: %w", err)
-	}
-
-	cleaned, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to count affected rows: %w", err)
-	}
-
-	// Commit
-	err = tx.Commit()
-	if err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	a.logger.Infof("Removed %d expired rows", cleaned)
-	return nil
-}
-
-// UpdateLastCleanup sets the 'last-cleanup' value only if it's less than cleanupInterval.
-// Returns true if the row was updated, which means that the cleanup can proceed.
-func (a *sqliteDBAccess) UpdateLastCleanup(db querier, cleanupInterval time.Duration) (bool, error) {
-	queryCtx, cancel := context.WithTimeout(a.ctx, a.metadata.timeout)
-	defer cancel()
-	res, err := db.ExecContext(queryCtx,
-		fmt.Sprintf(`INSERT INTO %s (key, value)
-		VALUES ('last-cleanup', CURRENT_TIMESTAMP)
-		ON CONFLICT (key)
-		DO UPDATE SET value = CURRENT_TIMESTAMP
-			WHERE (unixepoch(CURRENT_TIMESTAMP) - unixepoch(value)) > 1;`,
-			a.metadata.MetadataTableName),
-		cleanupInterval.Milliseconds()-100, // Subtract 100ms for some buffer
-	)
-	if err != nil {
-		return false, fmt.Errorf("failed to execute query: %w", err)
-	}
-
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("failed to retrieve affected row count: %w", err)
-	}
-	return n > 0, nil
 }
 
 // GetConnection returns the database connection object.
